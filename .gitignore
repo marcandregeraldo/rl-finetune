@@ -1,0 +1,43 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# uv
+uv.lock
+
+# Models and checkpoints (large files)
+models/
+checkpoints/
+*.gguf
+*.safetensors
+*.bin
+merged_model/
+merged_model_tmp/
+
+# Environment
+.env
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Promptfoo
+.promptfoo/
+promptfoo-output.json
+
+# Logs
+*.log
+trainer_log.jsonl
