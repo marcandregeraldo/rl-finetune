@@ -71,7 +71,7 @@ def main(config: dict):
         r=config.get("lora_r", 8),
         lora_alpha=config.get("lora_alpha", 16),
         lora_dropout=config.get("lora_dropout", 0.05),
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        target_modules=config.get("lora_target_modules", ["q_proj", "k_proj", "v_proj", "o_proj"]),
         bias="none",
         task_type="CAUSAL_LM",
     )
@@ -104,7 +104,7 @@ def main(config: dict):
         callbacks.append(WeightSyncCallback(config, sync_every=sync_every)())
 
     rollout_func = make_rollout_func(config)
-    model_name = config.get("model", "Qwen/Qwen3-1.7B")
+    model_name = config.get("model", "Qwen/Qwen3.5-2B")
     logger.info("Loading model: %s", model_name)
 
     trainer = GRPOTrainer(

@@ -2,7 +2,7 @@
 # Override any value with: rl train --config my_config.yaml
 
 # Model
-model: Qwen/Qwen3-1.7B
+model: Qwen/Qwen3.5-2B
 lora_r: 8
 lora_alpha: 16
 lora_dropout: 0.05
