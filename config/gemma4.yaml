@@ -1,0 +1,54 @@
+# Gemma 4 E2B training configuration
+# Memory budget: ~14 GB (tighter fit on 24GB MPS)
+#   - Policy model (bf16):  ~5 GB
+#   - Reference model (bf16): ~5 GB
+#   - LoRA + optimizer:     ~2 GB
+#   - Generation cache:     ~2 GB
+
+# Model
+model: google/gemma-4-e2b-it
+lora_r: 8
+lora_alpha: 16
+lora_dropout: 0.05
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+
+# Environment
+env: wordle
+env_url: http://localhost:8001
+
+# GRPO training hyperparameters (tuned for M4 Pro 24GB MPS)
+learning_rate: 5.0e-6
+warmup_ratio: 0.1
+max_grad_norm: 1.0
+max_steps: 1000
+num_train_epochs: null
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 16   # doubled (from 8) to compensate for fewer generations
+num_generations: 2                # reduced (from 4) to fit in memory
+max_completion_length: 768        # reduced (from 1024) to save activation memory
+gradient_checkpointing: true
+bf16: true
+optim: adamw_torch
+
+# Logging / checkpointing
+logging_steps: 1
+save_steps: 50
+save_total_limit: 3
+output_dir: checkpoints/grpo-gemma4
+
+# llama-server (for rollouts)
+llama_server_url: http://localhost:8080
+llama_server_port: 8080
+temperature: 0.8
+top_p: 0.95
+
+# Weight sync (LoRA -> GGUF -> reload llama-server)
+sync_every: 50
+quantize: q4_k_m
+
+# Promptfoo eval (run after training)
+eval_config: evals/promptfooconfig.yaml
