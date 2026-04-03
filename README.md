@@ -16,21 +16,29 @@ Finetunes **Qwen3.5-2B** (or **Gemma 4 E2B**) with GRPO (Group Relative Policy O
 ```mermaid
 flowchart TD
     subgraph train["rl train"]
-        GRPO["GRPOTrainer\n(PyTorch MPS, bf16 + LoRA)"]
-        GRPO -- "rollout_func" --> llama["llama-server :8080\n(GGUF, Metal-accelerated)"]
-        GRPO -- "environment" --> env["OpenEnv Wordle :8001\n(Docker)"]
-        GRPO -- "callbacks" --> dash["DashboardCallback\n(Rich Live TUI)"]
-        GRPO -- "callbacks" --> sync["WeightSyncCallback"]
-        sync -- "every N steps" --> merge["Merge LoRA → GGUF\n→ reload server"]
+        GRPO["GRPOTrainer
+        PyTorch MPS, bf16 + LoRA"]
+        GRPO -- rollout_func --> llama["llama-server :8080
+        GGUF, Metal-accelerated"]
+        GRPO -- environment --> env["OpenEnv Wordle :8001
+        Docker"]
+        GRPO -- callbacks --> dash["DashboardCallback
+        Rich Live TUI"]
+        GRPO -- callbacks --> sync["WeightSyncCallback"]
+        sync -- every N steps --> merge["Merge LoRA to GGUF
+        and reload server"]
         merge -.-> llama
     end
 
-    train -- "after training" --> post["Post-Training"]
+    train -- after training --> post
 
     subgraph post["Post-Training"]
-        export["rl export\nLoRA checkpoint → GGUF"]
-        serve["rl serve\nllama-server with finetuned model"]
-        eval["rl eval\npromptfoo evaluation suite"]
+        export["rl export
+        LoRA checkpoint to GGUF"]
+        serve["rl serve
+        llama-server with finetuned model"]
+        eval["rl eval
+        promptfoo evaluation suite"]
         export --> serve --> eval
     end
 ```
