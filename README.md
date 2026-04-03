@@ -2,7 +2,7 @@
 
 Lightweight local RL post-training for LLMs on Apple Silicon.
 
-Finetunes **Qwen3-1.7B** with GRPO (Group Relative Policy Optimization) using:
+Finetunes **Qwen3.5-2B** (or **Gemma 4 E2B**) with GRPO (Group Relative Policy Optimization) using:
 - **TRL v1.0** `GRPOTrainer` for the training loop
 - **llama-server** (llama.cpp, Metal-accelerated) for fast rollout generation
 - **OpenEnv** Wordle as the initial multi-turn environment
@@ -13,29 +13,26 @@ Finetunes **Qwen3-1.7B** with GRPO (Group Relative Policy Optimization) using:
 
 ## Architecture
 
-```
-┌──────────────────────────────────────────────────────┐
-│                     rl train                         │
-│                                                      │
-│  GRPOTrainer (PyTorch MPS)                          │
-│    ├── rollout_func ──► llama-server :8080 (Metal)  │
-│    │                    (GGUF, fast generation)      │
-│    ├── environment ──► OpenEnv Wordle :8001 (Docker)│
-│    └── callbacks:                                    │
-│         ├── DashboardCallback (Rich Live TUI)        │
-│         └── WeightSyncCallback (LoRA → GGUF sync)   │
-│                     │                                │
-│              every N steps:                          │
-│         merge LoRA → GGUF → reload server            │
-└──────────────────────────────────────────────────────┘
-                     │
-              after training:
-                     │
-┌────────────────────▼─────────────────────────────────┐
-│  rl export → models/finetuned.gguf                  │
-│  rl serve  → llama-server serves finetuned model    │
-│  rl eval   → promptfoo eval suite                   │
-└──────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph train["rl train"]
+        GRPO["GRPOTrainer\n(PyTorch MPS, bf16 + LoRA)"]
+        GRPO -- "rollout_func" --> llama["llama-server :8080\n(GGUF, Metal-accelerated)"]
+        GRPO -- "environment" --> env["OpenEnv Wordle :8001\n(Docker)"]
+        GRPO -- "callbacks" --> dash["DashboardCallback\n(Rich Live TUI)"]
+        GRPO -- "callbacks" --> sync["WeightSyncCallback"]
+        sync -- "every N steps" --> merge["Merge LoRA → GGUF\n→ reload server"]
+        merge -.-> llama
+    end
+
+    train -- "after training" --> post["Post-Training"]
+
+    subgraph post["Post-Training"]
+        export["rl export\nLoRA checkpoint → GGUF"]
+        serve["rl serve\nllama-server with finetuned model"]
+        eval["rl eval\npromptfoo evaluation suite"]
+        export --> serve --> eval
+    end
 ```
 
 ---
@@ -59,10 +56,10 @@ Finetunes **Qwen3-1.7B** with GRPO (Group Relative Policy Optimization) using:
 git clone <repo> rl-finetune && cd rl-finetune
 uv sync
 
-# 2. Download base model (Qwen3-1.7B GGUF)
+# 2. Download base model (Qwen3.5-2B GGUF)
 mkdir -p models
-huggingface-cli download Qwen/Qwen3-1.7B-GGUF \
-  Qwen3-1.7B-Q4_K_M.gguf --local-dir models
+huggingface-cli download Qwen/Qwen3.5-2B-GGUF \
+  Qwen3.5-2B-Q4_K_M.gguf --local-dir models
 
 # 3. Start services
 rl env start wordle          # OpenEnv Wordle in Docker (:8001)
@@ -148,7 +145,7 @@ rl status   Show llama-server health, OpenEnv status, latest checkpoint
 Edit `config/default.yaml` to tune training:
 
 ```yaml
-model: Qwen/Qwen3-1.7B          # HuggingFace model ID
+model: Qwen/Qwen3.5-2B          # HuggingFace model ID
 env: wordle                      # OpenEnv environment
 learning_rate: 5.0e-6
 num_generations: 4               # GRPO group size
@@ -156,7 +153,11 @@ max_completion_length: 1024
 sync_every: 50                   # LoRA→GGUF sync frequency (steps)
 ```
 
-Pass a custom config: `rl train --config my_config.yaml`
+A Gemma 4 E2B config is also provided with memory-adjusted settings:
+
+```bash
+rl train --config config/gemma4.yaml
+```
 
 ---
 
@@ -203,7 +204,8 @@ reward_funcs=[my_reward],
 
 ```
 rl-finetune/
-├── config/default.yaml      Training config
+├── config/default.yaml      Training config (Qwen3.5-2B)
+├── config/gemma4.yaml       Training config (Gemma 4 E2B)
 ├── envs/wordle.py           OpenEnv Wordle adapter
 ├── rewards.py               TRL reward functions
 ├── rollout.py               Custom llama-server rollout_func
@@ -219,15 +221,27 @@ rl-finetune/
 
 ## Memory Budget (M4 Pro 24GB)
 
+### Qwen3.5-2B (default)
+
 | Component | VRAM |
 |-----------|------|
-| Qwen3-1.7B bf16 (policy) | ~4 GB |
-| Qwen3-1.7B bf16 (reference) | ~4 GB |
+| Qwen3.5-2B bf16 (policy) | ~4 GB |
+| Qwen3.5-2B bf16 (reference) | ~4 GB |
 | LoRA adapters + optimizer | ~2 GB |
 | Generation cache | ~2 GB |
 | **Total** | **~12 GB** |
 
-Comfortable on 24GB. If you hit OOM, reduce `num_generations` from 4 → 2 or `max_completion_length` from 1024 → 512.
+### Gemma 4 E2B (`config/gemma4.yaml`)
+
+| Component | VRAM |
+|-----------|------|
+| Gemma 4 E2B bf16 (policy) | ~5 GB |
+| Gemma 4 E2B bf16 (reference) | ~5 GB |
+| LoRA adapters + optimizer | ~2 GB |
+| Generation cache | ~2 GB |
+| **Total** | **~14 GB** |
+
+Both fit comfortably on 24GB. If you hit OOM, reduce `num_generations` (4 → 2) or `max_completion_length` (1024 → 512).
 
 ---
 
