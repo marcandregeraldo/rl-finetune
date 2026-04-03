@@ -1,0 +1,45 @@
+# Default training configuration for rl-finetune
+# Override any value with: rl train --config my_config.yaml
+
+# Model
+model: Qwen/Qwen3-1.7B
+lora_r: 8
+lora_alpha: 16
+lora_dropout: 0.05
+
+# Environment
+env: wordle                        # "wordle" | path to custom env module
+env_url: http://localhost:8001     # Docker container URL
+
+# GRPO training hyperparameters (tuned for M4 Pro 24GB MPS)
+learning_rate: 5.0e-6
+warmup_ratio: 0.1
+max_grad_norm: 1.0
+max_steps: 1000                    # set null to train for num_train_epochs
+num_train_epochs: null
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 8
+num_generations: 4                 # GRPO group size
+max_completion_length: 1024        # tokens per completion
+gradient_checkpointing: true
+bf16: true
+optim: adamw_torch                 # no bitsandbytes on MPS
+
+# Logging / checkpointing
+logging_steps: 1
+save_steps: 50
+save_total_limit: 3
+output_dir: checkpoints/grpo
+
+# llama-server (for rollouts)
+llama_server_url: http://localhost:8080
+llama_server_port: 8080
+temperature: 0.8
+top_p: 0.95
+
+# Weight sync (LoRA -> GGUF -> reload llama-server)
+sync_every: 50                     # steps between syncs (0 = disable)
+quantize: q4_k_m
+
+# Promptfoo eval (run after training)
+eval_config: evals/promptfooconfig.yaml
