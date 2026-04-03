@@ -1,0 +1,71 @@
+# Promptfoo evaluation config for rl-finetune
+#
+# Prerequisites:
+#   1. Start llama-server: rl serve --model models/finetuned.gguf
+#   2. Run evals:         rl eval
+#   3. Browse results:    rl eval --view
+#
+# Install promptfoo: npm install -g promptfoo
+
+providers:
+  - id: openai:http://localhost:8080/v1
+    config:
+      apiKey: "none"           # llama-server doesn't require an API key
+      model: local             # model name is ignored by llama-server
+
+prompts:
+  - "{{prompt}}"
+
+# ---- Wordle capability tests ----
+tests:
+  - description: "Model makes a valid 5-letter first guess"
+    vars:
+      prompt: |
+        You are playing Wordle. Guess a 5-letter English word.
+        Reply with only the word, all uppercase. No punctuation.
+    assert:
+      - type: regex
+        value: "^[A-Z]{5}$"
+
+  - description: "Model updates guess after feedback"
+    vars:
+      prompt: |
+        You are playing Wordle. Your previous guess was CRANE.
+        Feedback: C=⬜ R=🟨 A=⬜ N=🟩 E=⬜
+        (R is in the word but wrong position, N is correct)
+        Make your next guess. Reply with only the 5-letter word, uppercase.
+    assert:
+      - type: regex
+        value: "^[A-Z]{5}$"
+      - type: javascript
+        # Should not reuse letters marked grey (C, A, E) or repeat R in same position
+        value: "!output.includes('CRANE') && output.length === 5"
+
+  - description: "Model explains Wordle strategy"
+    vars:
+      prompt: "In Wordle, what makes a good opening guess? Answer in 2 sentences."
+    assert:
+      - type: contains-any
+        value: ["common", "vowel", "frequent", "letters", "STARE", "CRANE", "AUDIO"]
+      - type: javascript
+        value: "output.length > 20"
+
+  - description: "Model handles all-grey feedback"
+    vars:
+      prompt: |
+        You are playing Wordle. Your guess STARE got all grey squares ⬜⬜⬜⬜⬜.
+        None of those letters (S, T, A, R, E) are in the word.
+        What do you guess next? Reply with only the 5-letter word, uppercase.
+    assert:
+      - type: regex
+        value: "^[A-Z]{5}$"
+      - type: javascript
+        # Should not contain any of the grey letters
+        value: |
+          const grey = ['S','T','A','R','E'];
+          !grey.some(l => output.includes(l))
+
+evaluateOptions:
+  maxConcurrency: 2
+  cache: true
+  timeoutMs: 30000
