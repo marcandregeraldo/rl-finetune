@@ -13,27 +13,7 @@ Finetunes **Qwen3.5-2B** (or **Gemma 4 E2B**) with GRPO (Group Relative Policy O
 
 ## Architecture
 
-```mermaid
-flowchart TD
-    subgraph train["rl train"]
-        GRPO["GRPOTrainer<br/>PyTorch MPS, bf16 + LoRA"]
-        GRPO -- rollout_func --> llama["llama-server :8080<br/>GGUF, Metal-accelerated"]
-        GRPO -- environment --> env["OpenEnv Wordle :8001<br/>Docker"]
-        GRPO -- callbacks --> dash["DashboardCallback<br/>Rich Live TUI"]
-        GRPO -- callbacks --> sync["WeightSyncCallback"]
-        sync -- every N steps --> merge["Merge LoRA to GGUF<br/>and reload server"]
-        merge -.-> llama
-    end
-
-    train -- after training --> post
-
-    subgraph post["Post-Training"]
-        export["rl export<br/>LoRA checkpoint to GGUF"]
-        serve["rl serve<br/>llama-server with finetuned model"]
-        eval["rl eval<br/>promptfoo evaluation suite"]
-        export --> serve --> eval
-    end
-```
+![Architecture](docs/architecture.svg)
 
 ---
 
