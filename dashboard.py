@@ -1,14 +1,29 @@
 from __future__ import annotations
 
+import time
+
 import torch
 from rich.console import Console
 from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
-from rich.progress import BarColumn, MofNCompleteColumn, Progress, TimeRemainingColumn
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 from rich.table import Table
 from rich.text import Text
 from transformers import TrainerCallback, TrainerControl, TrainerState, TrainingArguments
+
+try:
+    import psutil as _psutil
+    _HAS_PSUTIL = True
+except ImportError:
+    _HAS_PSUTIL = False
 
 _SPARK_CHARS = " ▁▂▃▄▅▆▇█"
 
@@ -29,11 +44,33 @@ def _sparkline(values: list[float], width: int = 20) -> str:
     return "".join(chars)
 
 
-def _mps_memory_gb() -> float | None:
-    """Return current MPS allocated memory in GB, or None if not available."""
+def _mps_memory_gb() -> tuple[float, float] | None:
+    """Return (allocated_gb, driver_allocated_gb) for MPS, or None."""
     if torch.backends.mps.is_available():
-        return torch.mps.current_allocated_memory() / 1e9
+        return (
+            torch.mps.current_allocated_memory() / 1e9,
+            torch.mps.driver_allocated_memory() / 1e9,
+        )
     return None
+
+
+def _cuda_memory_gb() -> tuple[float, float] | None:
+    """Return (allocated_gb, reserved_gb) for CUDA, or None."""
+    if torch.cuda.is_available():
+        return (
+            torch.cuda.memory_allocated() / 1e9,
+            torch.cuda.memory_reserved() / 1e9,
+        )
+    return None
+
+
+def _fmt_elapsed(seconds: float) -> str:
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    if h:
+        return f"{h}h{m:02d}m{s:02d}s"
+    return f"{m}m{s:02d}s"
 
 
 class DashboardCallback(TrainerCallback):
@@ -43,17 +80,23 @@ class DashboardCallback(TrainerCallback):
         trainer = GRPOTrainer(..., callbacks=[DashboardCallback()])
     """
 
-    def __init__(self, reward_history_len: int = 40):
+    def __init__(self, history_len: int = 40):
         self.reward_history: list[float] = []
-        self.reward_history_len = reward_history_len
+        self.loss_history: list[float] = []
+        self.history_len = history_len
         self.latest_logs: dict = {}
         self.latest_generation: str = ""
         self.total_steps: int = 0
         self._live: Live | None = None
+        self._train_start: float = 0.0
+        self._last_step_time: float = 0.0
+        self._throughput: float = 0.0
         self._progress = Progress(
+            SpinnerColumn(),
             "[progress.description]{task.description}",
             BarColumn(),
             MofNCompleteColumn(),
+            TimeElapsedColumn(),
             TimeRemainingColumn(),
         )
         self._task_id = None
@@ -67,6 +110,8 @@ class DashboardCallback(TrainerCallback):
     ):
         self.total_steps = state.max_steps or (args.num_train_epochs * state.num_train_epochs)
         self._task_id = self._progress.add_task("[cyan]Training", total=self.total_steps)
+        self._train_start = time.time()
+        self._last_step_time = time.time()
         self._live = Live(self._render(), console=console, refresh_per_second=4, transient=False)
         self._live.start()
 
@@ -94,8 +139,12 @@ class DashboardCallback(TrainerCallback):
             self.latest_logs.update(logs)
             if "rewards/mean" in logs:
                 self.reward_history.append(logs["rewards/mean"])
-                if len(self.reward_history) > self.reward_history_len:
+                if len(self.reward_history) > self.history_len:
                     self.reward_history.pop(0)
+            if "loss" in logs:
+                self.loss_history.append(logs["loss"])
+                if len(self.loss_history) > self.history_len:
+                    self.loss_history.pop(0)
         self._refresh()
 
     def on_step_end(
@@ -105,6 +154,16 @@ class DashboardCallback(TrainerCallback):
         control: TrainerControl,
         **kwargs,
     ):
+        now = time.time()
+        dt = now - self._last_step_time
+        if dt > 0:
+            new_tput = 1.0 / dt
+            self._throughput = (
+                new_tput if self._throughput == 0.0
+                else 0.85 * self._throughput + 0.15 * new_tput
+            )
+        self._last_step_time = now
+
         if self._task_id is not None:
             self._progress.advance(self._task_id)
         if torch.backends.mps.is_available():
@@ -126,7 +185,7 @@ class DashboardCallback(TrainerCallback):
         layout = Layout()
         layout.split_column(
             Layout(name="top", size=3),
-            Layout(name="middle", size=10),
+            Layout(name="middle", size=16),
             Layout(name="bottom"),
         )
         layout["top"].update(self._progress)
@@ -136,23 +195,43 @@ class DashboardCallback(TrainerCallback):
 
     def _metrics_panel(self) -> Panel:
         logs = self.latest_logs
-        table = Table.grid(padding=(0, 2))
-        table.add_column(style="bold cyan", no_wrap=True)
-        table.add_column()
 
         def _fmt(key: str, fmt: str = ".4f") -> str:
             v = logs.get(key)
             return f"{v:{fmt}}" if v is not None else "[dim]—[/dim]"
 
-        table.add_row("loss", _fmt("loss"))
-        table.add_row("reward (mean)", _fmt("rewards/mean"))
-        table.add_row("KL divergence", _fmt("kl"))
-        table.add_row("learning rate", _fmt("learning_rate", ".2e"))
-        table.add_row("step", str(logs.get("step", "—")))
-        table.add_row("reward trend", f"[yellow]{_sparkline(self.reward_history)}[/yellow]")
-        mem = _mps_memory_gb()
-        if mem is not None:
-            table.add_row("MPS memory", f"{mem:.2f} GB")
+        table = Table.grid(padding=(0, 3))
+        table.add_column(style="bold cyan", no_wrap=True)
+        table.add_column(no_wrap=True)
+        table.add_column(style="bold cyan", no_wrap=True)
+        table.add_column(no_wrap=True)
+
+        table.add_row("loss",        _fmt("loss"),                   "grad norm",   _fmt("grad_norm", ".3f"))
+        table.add_row("reward",      _fmt("rewards/mean"),           "reward std",  _fmt("rewards/std"))
+        table.add_row("KL",          _fmt("kl"),                     "lr",          _fmt("learning_rate", ".2e"))
+        table.add_row(
+            "loss trend",   f"[green]{_sparkline(self.loss_history)}[/green]",
+            "reward trend", f"[yellow]{_sparkline(self.reward_history)}[/yellow]",
+        )
+
+        elapsed = time.time() - self._train_start if self._train_start else 0.0
+        tput = f"{self._throughput:.2f} steps/s" if self._throughput > 0 else "[dim]—[/dim]"
+        table.add_row("throughput", tput, "elapsed", _fmt_elapsed(elapsed))
+
+        mps = _mps_memory_gb()
+        cuda = _cuda_memory_gb()
+        if mps is not None:
+            table.add_row("MPS alloc", f"{mps[0]:.2f} GB", "MPS driver", f"{mps[1]:.2f} GB")
+        elif cuda is not None:
+            table.add_row("CUDA alloc", f"{cuda[0]:.2f} GB", "CUDA reserved", f"{cuda[1]:.2f} GB")
+
+        if _HAS_PSUTIL:
+            cpu = _psutil.cpu_percent()
+            mem = _psutil.virtual_memory()
+            table.add_row(
+                "CPU util", f"{cpu:.0f}%",
+                "RAM", f"{mem.used / 1e9:.1f} / {mem.total / 1e9:.1f} GB",
+            )
 
         return Panel(table, title="[bold]Metrics[/bold]", border_style="blue")
 

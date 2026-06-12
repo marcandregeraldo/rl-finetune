@@ -3,6 +3,7 @@
 
 # Model
 model: Qwen/Qwen3.5-2B
+device_map: mps                    # "mps" avoids Accelerate auto-offload bug on macOS; use "cuda" for NVIDIA
 lora_r: 8
 lora_alpha: 16
 lora_dropout: 0.05
@@ -10,6 +11,7 @@ lora_dropout: 0.05
 # Environment
 env: wordle                        # "wordle" | path to custom env module
 env_url: http://localhost:8001     # Docker container URL
+max_concurrent_envs: 16           # Max WebSocket sessions per container
 
 # GRPO training hyperparameters (tuned for M4 Pro 24GB MPS)
 learning_rate: 5.0e-6

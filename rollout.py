@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-import httpx
+from openai import AsyncOpenAI
 
 logger = logging.getLogger(__name__)
 
@@ -31,37 +31,31 @@ def _build_rollout_func(
     Returns:
         A rollout_func compatible with GRPOTrainer.
     """
+    client = AsyncOpenAI(base_url=f"{server_url}/v1", api_key="not-needed", timeout=timeout)
 
-    async def _generate_one(client: httpx.AsyncClient, prompt: str) -> list[dict]:
+    async def _generate_one(messages: list[dict]) -> list:
         """Generate num_generations completions for a single prompt."""
-        payload = {
-            "prompt": prompt,
-            "n": num_generations,
-            "temperature": temperature,
-            "top_p": top_p,
-            "max_tokens": max_tokens,
-            "logprobs": True,
-            "echo": False,
-        }
-        resp = await client.post(
-            f"{server_url}/v1/completions",
-            json=payload,
-            timeout=timeout,
+        resp = await client.chat.completions.create(
+            model="local",
+            messages=messages,
+            n=num_generations,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            logprobs=True,
         )
-        resp.raise_for_status()
-        return resp.json()["choices"]
+        return resp.choices
 
-    async def _generate_batch(prompts: list[str]) -> list[list[dict]]:
+    async def _generate_batch(all_messages: list[list[dict]]) -> list[list]:
         """Generate completions for a batch of prompts concurrently."""
-        async with httpx.AsyncClient() as client:
-            tasks = [_generate_one(client, p) for p in prompts]
-            return await asyncio.gather(*tasks)
+        tasks = [_generate_one(msgs) for msgs in all_messages]
+        return await asyncio.gather(*tasks)
 
-    def llamacpp_rollout(prompts: list[str], trainer) -> dict:
+    def llamacpp_rollout(prompts: list, trainer) -> dict:
         """rollout_func passed to GRPOTrainer.
 
         Args:
-            prompts: List of prompt strings (one per batch item).
+            prompts: List of chat message lists (structured, not templated).
             trainer: GRPOTrainer instance (used for tokenizer access).
 
         Returns:
@@ -74,17 +68,20 @@ def _build_rollout_func(
         completion_ids_batch = []
         logprobs_batch = []
 
-        for prompt, choices in zip(prompts, all_choices, strict=True):
-            prompt_ids = tokenizer.encode(prompt, add_special_tokens=True)
+        for messages, choices in zip(prompts, all_choices, strict=True):
+            prompt_text = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
 
             for choice in choices:
-                text = choice["text"]
+                text = choice.message.content or ""
                 completion_ids = tokenizer.encode(text, add_special_tokens=False)
 
-                # llama-server returns logprobs in choice["logprobs"]["token_logprobs"].
-                # Fall back to zeros if not available (importance ratio = 1).
-                raw_logprobs = choice.get("logprobs") or {}
-                token_logprobs = raw_logprobs.get("token_logprobs") or []
+                # Extract per-token logprobs from the OpenAI response
+                token_logprobs = []
+                if choice.logprobs and choice.logprobs.content:
+                    token_logprobs = [t.logprob for t in choice.logprobs.content]
 
                 if len(token_logprobs) >= len(completion_ids):
                     token_logprobs = token_logprobs[: len(completion_ids)]
