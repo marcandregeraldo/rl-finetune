@@ -7,7 +7,11 @@ import sys
 import tempfile
 from pathlib import Path
 
+import click
 import httpx
+import yaml
+from peft import AutoPeftModelForCausalLM
+from transformers import TrainerCallback
 
 logger = logging.getLogger(__name__)
 
@@ -22,8 +26,6 @@ def merge_lora(checkpoint_dir: str | Path, output_dir: str | Path) -> Path:
     Returns:
         Path to the merged model directory.
     """
-    from peft import AutoPeftModelForCausalLM
-
     checkpoint_dir = Path(checkpoint_dir)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -154,8 +156,6 @@ class WeightSyncCallback:
     """
 
     def __init__(self, config: dict, sync_every: int = 50):
-        from transformers import TrainerCallback
-
         self._config = config
         self._sync_every = sync_every
 
@@ -193,8 +193,6 @@ def _find_convert_script() -> Path | None:
 
 
 if __name__ == "__main__":
-    import click
-
     @click.group()
     def _cli():
         logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -204,8 +202,6 @@ if __name__ == "__main__":
     @click.option("--config", "-c", default="config/default.yaml")
     def _sync(checkpoint, config):
         """Merge + convert + reload (used during training)."""
-        import yaml
-
         with open(config) as f:
             cfg = yaml.safe_load(f)
         ok = sync_weights(checkpoint, cfg)

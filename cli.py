@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).parent / ".env")
 
 import click
 import httpx
 import yaml
+from export import convert_to_gguf, merge_lora
+from train import main as train_main
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -28,7 +36,16 @@ _ENV_PORTS = {
 }
 
 
-
+def _docker_login_hf() -> None:
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if not token:
+        return
+    subprocess.run(
+        ["docker", "login", "registry.hf.space", "-u", "user", "--password-stdin"],
+        input=token.encode(),
+        capture_output=True,
+        check=False,
+    )
 
 
 @click.group()
@@ -37,18 +54,23 @@ def cli():
     pass
 
 
-
-
-
 @cli.command()
-@click.option("--config", "-c", default=str(_DEFAULT_CONFIG), show_default=True, help="YAML config file")
-@click.option("--max-steps", type=int, default=None, help="Override max_steps in config")
-@click.option("--env", type=str, default=None, help="Override env in config (e.g. wordle)")
+@click.option(
+    "--config",
+    "-c",
+    default=str(_DEFAULT_CONFIG),
+    show_default=True,
+    help="YAML config file",
+)
+@click.option(
+    "--max-steps", type=int, default=None, help="Override max_steps in config"
+)
+@click.option(
+    "--env", type=str, default=None, help="Override env in config (e.g. wordle)"
+)
 @click.option("--dry-run", is_flag=True, help="Print resolved config and exit")
 def train(config, max_steps, env, dry_run):
     """Launch GRPO training with a config file."""
-    import yaml
-
     # Load config
     try:
         with open(config) as f:
@@ -64,7 +86,9 @@ def train(config, max_steps, env, dry_run):
         cfg["env"] = env
 
     if dry_run:
-        console.print(Panel(yaml.dump(cfg, default_flow_style=False), title="Resolved config"))
+        console.print(
+            Panel(yaml.dump(cfg, default_flow_style=False), title="Resolved config")
+        )
         return
 
     # Pre-flight checks
@@ -85,23 +109,27 @@ def train(config, max_steps, env, dry_run):
         )
     )
 
-    # Run training (import here to keep CLI startup fast)
-    from train import main as train_main
-
     try:
         train_main(cfg)
     except KeyboardInterrupt:
         console.print("\n[yellow]Training interrupted.[/yellow]")
 
 
-
-
-
 @cli.command()
 @click.option("--model", "-m", default=None, help="Path to GGUF model file")
 @click.option("--port", "-p", default=8080, show_default=True, help="Server port")
-@click.option("--ctx-size", default=4096, show_default=True, help="Context window size")
-@click.option("--config", "-c", default=str(_DEFAULT_CONFIG), help="YAML config to read defaults from")
+@click.option(
+    "--ctx-size",
+    default=16384,
+    show_default=True,
+    help="Context window size (0 = model's native maximum)",
+)
+@click.option(
+    "--config",
+    "-c",
+    default=str(_DEFAULT_CONFIG),
+    help="YAML config to read defaults from",
+)
 def serve(model, port, ctx_size, config):
     """Start llama-server for rollout generation and eval inference."""
     # Resolve model path
@@ -114,7 +142,9 @@ def serve(model, port, ctx_size, config):
             pass
 
         # Look for any GGUF in models/
-        guesses = sorted(Path("models").glob("*.gguf")) if Path("models").exists() else []
+        guesses = (
+            sorted(Path("models").glob("*.gguf")) if Path("models").exists() else []
+        )
         if guesses:
             model = str(guesses[-1])  # most recently modified
         else:
@@ -139,10 +169,14 @@ def serve(model, port, ctx_size, config):
     # Stream server output
     cmd = [
         "llama-server",
-        "-m", model,
-        "--port", str(port),
-        "--ctx-size", str(ctx_size),
-        "--n-gpu-layers", "99",
+        "-m",
+        model,
+        "--port",
+        str(port),
+        "--ctx-size",
+        str(ctx_size),
+        "--n-gpu-layers",
+        "99",
         "--cont-batching",
         "--log-prefix",
     ]
@@ -156,14 +190,20 @@ def serve(model, port, ctx_size, config):
         ) as proc:
             for line in proc.stdout:
                 console.print(f"[dim]{line.rstrip()}[/dim]")
+                if "unknown model architecture" in line:
+                    console.print(
+                        "[red]llama-server does not support this model architecture.\n"
+                        "Upgrade with: brew upgrade llama.cpp[/red]"
+                    )
+                    proc.terminate()
+                    sys.exit(1)
     except FileNotFoundError:
-        console.print("[red]llama-server not found. Install: brew install llama.cpp[/red]")
+        console.print(
+            "[red]llama-server not found. Install: brew install llama.cpp[/red]"
+        )
         sys.exit(1)
     except KeyboardInterrupt:
         console.print("\n[yellow]Server stopped.[/yellow]")
-
-
-
 
 
 @cli.group()
@@ -175,13 +215,30 @@ def env():
 @env.command("start")
 @click.argument("name", type=click.Choice(list(_ENV_IMAGES.keys())))
 @click.option("--port", type=int, default=None, help="Override default port")
-def env_start(name, port):
+@click.option("--max-envs", type=int, default=None, help="Max concurrent environments (default: from config)")
+def env_start(name, port, max_envs):
     """Start an OpenEnv environment container."""
     image = _ENV_IMAGES[name]
     host_port = port or _ENV_PORTS[name]
 
+    if max_envs is None:
+        try:
+            with open(_DEFAULT_CONFIG) as f:
+                cfg = yaml.safe_load(f)
+            max_envs = cfg.get("max_concurrent_envs", 16)
+        except Exception:
+            max_envs = 16
+
+    _docker_login_hf()
     console.print(f"[cyan]Pulling {image} …[/cyan]")
-    subprocess.run(["docker", "pull", image], check=True)
+    pull = subprocess.run(["docker", "pull", image], capture_output=True)
+    if pull.returncode != 0:
+        space_url = f"https://huggingface.co/spaces/openenv/{name}"
+        console.print(f"[yellow]Pull failed — building from {space_url} …[/yellow]")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = Path(tmpdir) / "src"
+            subprocess.run(["git", "clone", space_url, str(src)], check=True)
+            subprocess.run(["docker", "build", "-t", image, str(src)], check=True)
 
     container_name = f"openenv-{name}"
 
@@ -192,16 +249,27 @@ def env_start(name, port):
     )
 
     console.print(f"[cyan]Starting {name} on port {host_port} …[/cyan]")
-    subprocess.run(
-        [
-            "docker", "run", "-d",
-            "--name", container_name,
-            "-p", f"{host_port}:8000",
-            image,
-        ],
-        check=True,
+    run_cmd = [
+        "docker",
+        "run",
+        "-d",
+        "--name",
+        container_name,
+        "-p",
+        f"{host_port}:8000",
+        "-e",
+        f"MAX_CONCURRENT_ENVS={max_envs}",
+    ]
+    # Mount patched server app that reads MAX_CONCURRENT_ENVS
+    server_app_patch = _REPO_ROOT / "envs" / f"{name}_server_app.py"
+    if server_app_patch.exists():
+        run_cmd.extend(["-v", f"{server_app_patch}:/app/env/server/app.py:ro"])
+    run_cmd.append(image)
+    subprocess.run(run_cmd, check=True)
+    console.print(
+        f"[green]{name} environment running at http://localhost:{host_port} "
+        f"(max {max_envs} concurrent sessions)[/green]"
     )
-    console.print(f"[green]{name} environment running at http://localhost:{host_port}[/green]")
 
 
 @env.command("stop")
@@ -225,24 +293,22 @@ def env_ls():
     for name, image in _ENV_IMAGES.items():
         port = _ENV_PORTS[name]
         status = _container_status(f"openenv-{name}")
-        status_str = "[green]running[/green]" if status == "running" else "[dim]stopped[/dim]"
+        status_str = (
+            "[green]running[/green]" if status == "running" else "[dim]stopped[/dim]"
+        )
         table.add_row(name, str(port), image, status_str)
 
     console.print(table)
 
 
-
-
-
 @cli.command()
-@click.option("--checkpoint", "-k", required=True, help="Path to TRL checkpoint directory")
+@click.option(
+    "--checkpoint", "-k", required=True, help="Path to TRL checkpoint directory"
+)
 @click.option("--output", "-o", default="models/finetuned.gguf", show_default=True)
 @click.option("--quantize", "-q", default="q4_k_m", show_default=True)
 def export(checkpoint, output, quantize):
     """Convert a LoRA checkpoint to GGUF for llama-server."""
-    from export import convert_to_gguf, merge_lora
-    import tempfile
-
     console.print(f"[cyan]Merging LoRA from {checkpoint} …[/cyan]")
     with console.status("[bold yellow]Merging…"):
         with tempfile.TemporaryDirectory(prefix="rl-merged-") as tmp:
@@ -253,9 +319,6 @@ def export(checkpoint, output, quantize):
         convert_to_gguf(merged, output, quantize=quantize)
 
     console.print(f"[green]Export complete: {output}[/green]")
-
-
-
 
 
 @cli.command()
@@ -271,19 +334,20 @@ def eval(config, view):
     try:
         subprocess.run(["promptfoo", "eval", "--config", config], check=True)
     except FileNotFoundError:
-        console.print("[red]promptfoo not found. Install: npm install -g promptfoo[/red]")
+        console.print(
+            "[red]promptfoo not found. Install: npm install -g promptfoo[/red]"
+        )
         sys.exit(1)
 
     if view:
         subprocess.run(["promptfoo", "view"])
 
 
-
-
-
 @cli.command()
 @click.option("--config", "-c", default=str(_DEFAULT_CONFIG))
-def status(config, ):
+def status(
+    config,
+):
     """Show llama-server health, OpenEnv status, and latest checkpoint."""
     try:
         with open(config) as f:
@@ -302,7 +366,11 @@ def status(config, ):
     # llama-server health
     try:
         resp = httpx.get(f"{llama_url}/health", timeout=3.0)
-        llama_status = "[green]healthy[/green]" if resp.status_code == 200 else f"[red]HTTP {resp.status_code}[/red]"
+        llama_status = (
+            "[green]healthy[/green]"
+            if resp.status_code == 200
+            else f"[red]HTTP {resp.status_code}[/red]"
+        )
     except Exception:
         llama_status = "[red]unreachable[/red]"
     table.add_row("llama-server", f"{llama_url}  {llama_status}")
@@ -310,14 +378,20 @@ def status(config, ):
     # OpenEnv health
     try:
         resp = httpx.get(f"{env_url}/health", timeout=3.0)
-        env_status = "[green]healthy[/green]" if resp.status_code == 200 else f"[red]HTTP {resp.status_code}[/red]"
+        env_status = (
+            "[green]healthy[/green]"
+            if resp.status_code == 200
+            else f"[red]HTTP {resp.status_code}[/red]"
+        )
     except Exception:
         env_status = "[red]unreachable[/red]"
     table.add_row("OpenEnv", f"{env_url}  {env_status}")
 
     # Latest checkpoint
     if output_dir.exists():
-        checkpoints = sorted(output_dir.glob("checkpoint-*"), key=lambda p: p.stat().st_mtime)
+        checkpoints = sorted(
+            output_dir.glob("checkpoint-*"), key=lambda p: p.stat().st_mtime
+        )
         if checkpoints:
             latest = checkpoints[-1]
             table.add_row("Latest checkpoint", str(latest))
@@ -336,9 +410,6 @@ def status(config, ):
         table.add_row("Checkpoints", "[dim]no output_dir yet[/dim]")
 
     console.print(table)
-
-
-
 
 
 def _check_llama_server(url: str):

@@ -3,7 +3,18 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+import click
 import yaml
+from datasets import Dataset
+from peft import LoraConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from trl import GRPOConfig, GRPOTrainer
+
+from dashboard import DashboardCallback
+from envs.wordle import make_wordle_env
+from export import WeightSyncCallback
+from rewards import wordle_efficiency_reward, wordle_win_reward
+from rollout import make_rollout_func
 
 logger = logging.getLogger(__name__)
 
@@ -14,8 +25,6 @@ def build_wordle_dataset(num_words: int = 2000):
     Returns a HF Dataset with a 'prompt' column of chat messages.
     The model must guess the target word through multi-turn interaction.
     """
-    from datasets import Dataset
-
     # Same prompt structure; the Wordle environment picks a different secret word each episode.
     prompts = [
         [
@@ -53,15 +62,6 @@ def main(config: dict):
     Args:
         config: Dict loaded from config/default.yaml (possibly with overrides).
     """
-    from peft import LoraConfig
-    from trl import GRPOConfig, GRPOTrainer
-
-    from dashboard import DashboardCallback
-    from envs.wordle import make_wordle_env
-    from export import WeightSyncCallback
-    from rewards import wordle_efficiency_reward, wordle_win_reward
-    from rollout import make_rollout_func
-
     output_dir = config.get("output_dir", "checkpoints/grpo")
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
@@ -107,8 +107,18 @@ def main(config: dict):
     model_name = config.get("model", "Qwen/Qwen3.5-2B")
     logger.info("Loading model: %s", model_name)
 
+    model_init_kwargs = {}
+    if "device_map" in config:
+        model_init_kwargs["device_map"] = config["device_map"]
+    if "offload_folder" in config:
+        model_init_kwargs["offload_folder"] = config["offload_folder"]
+
+    model = AutoModelForCausalLM.from_pretrained(model_name, **model_init_kwargs) if model_init_kwargs else model_name
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+
     trainer = GRPOTrainer(
-        model=model_name,
+        model=model,
+        processing_class=tokenizer,
         reward_funcs=[wordle_win_reward, wordle_efficiency_reward],
         args=grpo_args,
         train_dataset=dataset,
@@ -118,14 +128,18 @@ def main(config: dict):
         callbacks=callbacks,
     )
 
-    trainer.train()
+    try:
+        trainer.train()
+    finally:
+        for env in getattr(trainer, "environments", None) or []:
+            if hasattr(env, "close"):
+                env.close()
+
     trainer.save_model(str(Path(output_dir) / "final"))
     logger.info("Training complete. Final checkpoint saved to %s/final", output_dir)
 
 
 if __name__ == "__main__":
-    import click
-
     @click.command()
     @click.option("--config", "-c", default="config/default.yaml")
     @click.option("--max-steps", type=int, default=None)

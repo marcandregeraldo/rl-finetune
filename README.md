@@ -38,7 +38,7 @@ uv sync
 
 # 2. Download base model (Qwen3.5-2B GGUF)
 mkdir -p models
-huggingface-cli download Qwen/Qwen3.5-2B-GGUF \
+hf download unsloth/Qwen3.5-2B-GGUF \
   Qwen3.5-2B-Q4_K_M.gguf --local-dir models
 
 # 3. Start services
