@@ -13,7 +13,7 @@ rubric-reward GRPO**. The core question is unchanged.
 > rubric-reward RL falls into?
 
 The second half makes this repo a direct talking point for the 2026 post-training recipe
-(`resume/applications/study/post-training-2026.md`). It's cheap to add because verl ships OPD.
+(`resume/study/post-training-2026.md`). It's cheap to add because verl ships OPD.
 
 ## Stack decision: verl on a single Modal node
 
@@ -106,7 +106,7 @@ The full plan is weeks of work. Interviews come sooner, so cut by what each proc
 | When | For | Do | Defer |
 |---|---|---|---|
 | **Now → Baseten technical rounds** | Baseten | Practical Python coding reps; vLLM lab rows 1–5; numbers from the work laptop; behavioural stories | Everything else here |
-| **In parallel, evenings** | **Handshake** (likely next technical loop) | `nano/` stage A on rungs 0–1 (loss, advantages, KL, masking **by hand**); HealthBench data + judge-vs-physician calibration; RLHF book chapters; `study/post-training-2026.md` | Stages B/C |
+| **In parallel, evenings** | **Handshake** (likely next technical loop) | `nano/` stage A on rungs 0–1 (loss, advantages, KL, masking **by hand**); HealthBench data + judge-vs-physician calibration; RLHF book chapters; `resume/study/post-training-2026.md` | Stages B/C |
 | Once Handshake technical is scheduled | Handshake | `nano/` OPD variant (a teacher logprob as the advantage; one small change once A works); rung 2 | verl |
 | If Cohere / Mistral move | Cohere: stage B (Ray actors, weight sync, staleness) + verl reading; Mistral: fine-tuning + eval story, in French | Modal verl runs, Ultra-Scale Playbook | MoE stage |
 | After the interviews | The repo as a research artifact | Modal verl runs, three arms, MentalHealthBench, MoE stage, SkyRL/OpenRLHF pages, MLflow on Modal | — |
