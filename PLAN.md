@@ -85,15 +85,18 @@ MentalHealthBench transfer → MoE stage → frameworks notes.
   `Reference` (frozen logprobs for KL, optional), `Reward`. One batch type, a dict of tensors
   (`input_ids`, `attention_mask`, `response_mask`, `old_logprobs`, `ref_logprobs`, `rewards`,
   `advantages`) plus metadata: your `DataProto`.
-- **Ray on Modal, one app for every scale** (`modal/ray_cluster.py`). An *entry* is a plain
-  `main(cfg) -> dict` that finds Ray already connected; the same code runs on the Mac. One node
-  (1–8 H100s): one container with a local Ray instance sized to its reservation (the
-  mila-logo-segmentation pattern). Two nodes: a Clustered Function with RDMA, bring-up after
-  Modal's Miles example (https://modal.com/docs/examples/miles_grpo). Rank 0 starts the Ray head
-  and waits for all 16 GPUs, rank 1 joins and blocks on a `modal.Queue` until rank 0 is done.
-  The image installs from the same `uv.lock` as the Mac. `nanorft/cluster_check.py` (`--entry check`)
-  times an NCCL all-reduce across every GPU: run it before any multi-node run, and check
-  `NET/IB` (RDMA) vs `NET/Socket` in the NCCL logs.
+- **Ray on Modal, one app for every scale** (`modal/ray_cluster.py`), following Modal's
+  multi-node training guide, Ray section (https://modal.com/docs/guide/multi-node-training).
+  Rank 0 starts the Ray head, waits for every GPU, and submits the experiment as a **Ray Job**
+  (`python -m <module> --config <run_dir>/config.yaml`), then tails its logs and fails the
+  call if the job didn't succeed. Other ranks start Ray workers pointed at the head and stay
+  alive until its port closes. Two nodes = a Clustered Function with RDMA (whole 8-GPU nodes
+  only); one node (1–8 GPUs) = the same head with no workers, for dev runs. The experiment just
+  calls `ray.init()`, so the same module runs on the Mac. Image: `nvidia/cuda` 13.0 devel (the
+  torch wheels are cu13) + libibverbs, then the same `uv.lock` as the Mac.
+  `nanorft/cluster_check.py` (`--entry check`) prints versions and times an NCCL all-reduce
+  across every GPU: run it before any multi-node run, and check `NET/IB` (RDMA) vs `NET/Socket`
+  in the NCCL logs.
 - **Miles for the scaled runs** (FSDP backend, colocated SGLang rollouts, TIS), from Modal's
   `miles_grpo` example: a tested 2 × 8-GPU recipe on the same Ray bring-up. **verl is read on
   the side** (its docs and `core_algos.py` vocabulary, table below). verl on 2 × 8 would work on
@@ -138,7 +141,7 @@ Checked on the Hub 24 Sep 2026: Qwen3.6 only ships 27B and 35B-A3B; Qwen3.5 has 
 
 | Use | Model | Note |
 |---|---|---|
-| Local `nanorft` (Mac) | **Qwen3.5-0.8B** instruct | M0 timing (`scripts/time_model.py`, fwd+bwd+AdamW at 4 × 256 tokens, MPS): **3.1 s/step, 13.5 GB** (torch fallback for Gated DeltaNet); Qwen2.5-0.5B-Instruct 1.05 s/step, 9.1 GB. Under the ~5 s/step rule; fall back to 0.5B if the generator OOMs next to the learner |
+| Local `nanorft` (Mac) | **Qwen3.5-0.8B** instruct | M0 timing (`scripts/time_model.py`, fwd+bwd+AdamW at 4 × 256 tokens, MPS, torch 2.14.1): **4.1 s/step, 13.2 GB** (torch fallback for Gated DeltaNet; 3.1 s/step on torch 2.11); Qwen2.5-0.5B-Instruct 0.97 s/step, 9.4 GB. Under the ~5 s/step rule, but close: fall back to 0.5B if the loop is too slow to iterate on or the generator OOMs next to the learner |
 | First Modal runs (Miles, 2 × 8 H100) | **Qwen3.5-2B → 4B** | Dense, full FT under FSDP; where the three arms run first. Check that Miles' FSDP backend and SGLang support Qwen3.5's Gated DeltaNet layers; else Qwen3-4B (the example's model). On CUDA, install flash-linear-attention + causal-conv1d, or HF falls back to the slow torch path |
 | OPD teacher | Qwen3.6-27B or Qwen3.5-27B | Same tokenizer family (verify vocabs); dense keeps logprob serving simple |
 | Judge | ~30B open model, **different family** from the teacher | Avoids "judged by a relative of its teacher" |

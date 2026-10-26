@@ -11,7 +11,7 @@ health conversations, or better at the grader? The plan, milestones and design a
 |---|---|
 | `src/nanorft/` | The trainer: generator, learner (Tinker-shaped `forward_backward` / `optim_step`), driver, losses. Pure PyTorch, then Ray actors. Subpackages `data/`, `rewards/`, `judge/` and `tracking.py` never import trainer modules |
 | `configs/` | Run configs (YAML), from M1 |
-| `modal/ray_cluster.py` | Ray clusters on Modal: 1 node (1-8 H100s) or 2 clustered 8-GPU nodes with RDMA |
+| `modal/ray_cluster.py` | Ray clusters on Modal (Modal's multi-node guide): experiments run as Ray Jobs on 1 node (1-8 H100s) or 2 clustered 8-GPU nodes with RDMA |
 | `scripts/` | `time_model.py` (step time + memory on this machine), `memory_math.py` (estimates) |
 
 ## Setup

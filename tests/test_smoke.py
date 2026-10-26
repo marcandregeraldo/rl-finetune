@@ -32,8 +32,12 @@ def test_modal_app_loads():
     )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    assert module.PYTHON_VERSION == (ROOT / ".python-version").read_text().strip()
-    assert set(module.ENTRIES) == {"check", "train"}
+    local = (ROOT / ".python-version").read_text().strip()
+    assert local.startswith(module.PYTHON_SERIES + ".")
+    assert module.ENTRIES == {
+        "check": "nanorft.cluster_check",
+        "train": "nanorft.driver",
+    }
 
 
 def test_cluster_check_needs_gpus():
