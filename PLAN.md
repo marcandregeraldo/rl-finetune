@@ -1,7 +1,7 @@
-# Plan: HealthBench RFT — `nano/` trainer locally, verl on Modal
+# Plan: HealthBench RFT — `nanorft` trainer locally, Ray on Modal
 
-**Status (16 Oct 2026): nothing built yet.** The repo still holds the December TRL + llama.cpp
-prototype; M0 replaces it. Day-by-day build slots live in the resume repo's interview plan
+**Status (26 Oct 2026): M0 done in the working tree** (old stack deleted, new skeleton,
+`modal/ray_cluster.py`, model timed, see "Models"). M1 next. Day-by-day build slots live in the resume repo's interview plan
 (`resume/interviews/2026-10-12_2026-11-08.md`); this file is the *what* and the *why*.
 Previous versions of this plan are in git history (v1: tag `v0-trl-llamacpp`; v2: before this commit).
 
@@ -41,7 +41,7 @@ gantt
     Handshake technicals         :crit, milestone, 2026-10-28, 0d
     Baseten technicals (est.)    :2026-11-02, 2026-11-06
     section Build
-    M0 reset + M1 nano rung 0    :m1, 2026-10-16, 2026-10-18
+    M0 reset + M1 rung 0         :m1, 2026-10-16, 2026-10-18
     pause for interviews         :done, 2026-10-18, 2026-11-01
     M2 data + M3 rung 1 SFT/DPO  :m3, 2026-11-01, 2026-11-06
     M4 judge + calibration       :m4, 2026-11-07, 2026-11-09
@@ -49,55 +49,64 @@ gantt
     M5 OPD, M7 Ray actors        :2026-11-10, 2026-11-22
 ```
 
-**Work split, so the learning is real:** you write `nano/algos.py` and the core of
-`nano/learner.py` by hand. Claude writes scaffolding, data loaders, the judge client and cache,
+**Work split, so the learning is real:** you write `nanorft/algos.py` and the core of
+`nanorft/learner.py` by hand. Claude writes scaffolding, data loaders, the judge client and cache,
 Modal apps, analysis scripts, and **the tests, first, as the spec**. Reference solutions go on a
-separate branch. Every milestone ends with `uv run pytest -q` and `uv run ruff check .` green and a
-dated `notes/journal.md` entry whose prediction was written *before* the run.
+separate branch. Every milestone ends with `uv run pytest -q` and `uv run ruff check .` green, and every run
+has its prediction written *before* the run, in the W&B run notes.
 
 | # | Milestone | When | Done when |
 |---|---|---|---|
-| **M0** | **Reset the repo.** Tag `v0-trl-llamacpp`; delete the old stack (list below); new `pyproject.toml` (package `rl_finetune`, extras `[nano]`, `[modal]`, dev pytest + ruff); MIT `LICENSE`; README rewritten to "what this repo is now", no results claimed; `scripts/time_model.py` → model decision in `notes/decisions.md` | Fri 16 Oct evening, ~1.5h | `uv sync --extra nano --extra dev` works, smoke test passes, model choice recorded |
-| **M1** | **`nano/` stage A on rung 0.** `protocol.py` (batch dict, `chunk`/`concat`); **`algos.py` (yours):** `token_logprobs`, `grpo_advantages` (+ `norm_adv_by_std`), `ppo_clip_loss`, `kl_k3`, `aggregate_loss(mode)`; **`learner.py` (yours):** Tinker-shaped `forward_backward` / `optim_step`, micro-batches + grad accumulation, checkpointing; `generator.py` (HF `generate`, left padding, token ids out); `reward_worker.py` + `rewards/verifiers.py`; `driver.py` with W&B | Fri 16 evening (algos) + Sat 17 morning (learner, driver), ~5h | Tests pass; arithmetic reward rises over ~100 steps with reward, KL, clip fraction, ratio min/max, entropy, length and the gen-vs-learner logprob gap logged |
+| **M0** | **Reset the repo.** Tag `v0-trl-llamacpp`; delete the old stack (list below); new `pyproject.toml` (Python 3.14, one package `src/nanorft`, extras `[train]` incl. Ray, `[modal]`, dev group pytest + ruff; `uv.lock` tracked); README rewritten to "what this repo is now", no results claimed; `scripts/time_model.py` → model decision in "Models"; **`modal/ray_cluster.py`** (Ray on Modal, below) + `nanorft/cluster_check.py` | Sun 25 – Mon 26 Oct | `uv sync --extra train --extra modal` works, smoke test passes, model choice recorded; `--entry check` on 1 GPU, 8 GPUs and 2 nodes (you run these) |
+| **M1** | **`nanorft` stage A on rung 0.** `protocol.py` (batch dict, `chunk`/`concat`); **`algos.py` (yours):** `token_logprobs`, `grpo_advantages` (+ `norm_adv_by_std`), `ppo_clip_loss`, `kl_k3`, `aggregate_loss(mode)`; **`learner.py` (yours):** Tinker-shaped `forward_backward` / `optim_step`, micro-batches + grad accumulation, checkpointing; `generator.py` (HF `generate`, left padding, token ids out); `reward_worker.py` + `rewards/verifiers.py` + `data/arithmetic.py`; `driver.py` with W&B; configs in `configs/` | Fri 16 evening (algos) + Sat 17 morning (learner, driver), ~5h | Tests pass; arithmetic reward rises over ~100 steps with reward, KL, clip fraction, ratio min/max, entropy, length and the gen-vs-learner logprob gap logged |
 | **M2** | **HealthBench data.** `schema.py`, `healthbench.py` (`oss_eval`, `hard`, `consensus`, `oss_meta_eval` → one schema); seeded per-conversation **criteria split** with negative criteria in both halves; `data/README.md` with stats; `mentalhealthbench.py` stub | Sun 1 Nov, ~2h | Split tests pass (deterministic, no criterion lost); stats written |
-| **M3** | **Rung 1 + SFT/DPO.** `data/medqa.py` (MedMCQA; check licence), letter-match verifier; **`algos.py` (yours):** `sft_loss`, `dpo_loss` (ref via LoRA-disable). Short runs on the same prompts: SFT, DPO, GRPO (OPD after M5). One table in `notes/journal.md` | Week of 2 Nov evenings, ~4h | GRPO beats base on held-out MedMCQA; the table exists; DPO loss = log 2 at init; SFT overfits one batch |
+| **M3** | **Rung 1 + SFT/DPO.** `data/medqa.py` (MedMCQA; check licence), letter-match verifier; **`algos.py` (yours):** `sft_loss`, `dpo_loss` (ref via LoRA-disable). Short runs on the same prompts: SFT, DPO, GRPO (OPD after M5). One table (the README's at M6) | Week of 2 Nov evenings, ~4h | GRPO beats base on held-out MedMCQA; the table exists; DPO loss = log 2 at init; SFT overfits one batch |
 | **M4** | **Judge + calibration on Modal.** Spend limit first. `modal/judge.py`: SGLang serving a ~30B open model (different family from the OPD teacher), scale-to-zero, pinned. `judge/client.py`: batched, retries, disk cache keyed on hash(conv + response + criterion + judge version); conversation + response first, criterion last (prefix cache); constrained JSON verdict + logprob → P(met). `rewards/rubric.py`: HealthBench points arithmetic, soft or hard. `analysis/calibrate.py` on ~2–3K `oss_meta_eval` judgments: κ / macro-F1 per axis, Brier/ECE + reliability plot, agreement vs response length | Sat 7 – Sun 8 Nov, ~5h | One agreement number and one calibration plot from one command; a rerun hits the cache 100% |
-| **M5** | **OPD in `nano/`.** **`algos.py` (yours):** per-token advantage = teacher logprob − student logprob. Same-tokenizer teacher, inference only | after M4, ~2h | Advantages all zero when teacher == student; OPD row in the M3 table |
+| **M5** | **OPD in `nanorft`.** **`algos.py` (yours):** per-token advantage = teacher logprob − student logprob. Same-tokenizer teacher, inference only | after M4, ~2h | Advantages all zero when teacher == student; OPD row in the M3 table |
 | **M6** | **Go public.** README: the question, the calibration number, the rung-1 table, what's next. Secrets check. You flip visibility | after M4 (gate: M1 + M3 GRPO row + M4 number), ~1.5h | Public, honest about state |
-| **M7** | **Stage B: Ray actors + async.** Generator and Learner as local Ray actors; weight sync via the object store; staleness knob with truncated importance sampling | mid-Nov, ~5h | Ratio and staleness logged; async loop runs on the Mac |
-| M1.5 | *Optional:* profile one learner step on a Modal H100 (`torch.profiler` + memory snapshot): predicted vs measured memory, MFU, one fix re-measured. Predictions from `scripts/memory_math.py`; exercises in `resume/study/memory-math.md` | if a Baseten or LawZero round asks for it | `notes/profiling.md` with two traces, the MFU number and the peak with/without checkpointing |
+| **M7** | **Stage B: Ray actors + async.** Generator and Learner as Ray actors; weight sync via the object store; staleness knob with truncated importance sampling. Same code on the Mac and on `modal/ray_cluster.py` (1 node, then 2) | mid-Nov, ~5h | Ratio and staleness logged; async loop runs on the Mac and on one Modal node |
+| M1.5 | *Optional:* profile one learner step on a Modal H100 (`torch.profiler` + memory snapshot): predicted vs measured memory, MFU, one fix re-measured. Predictions from `scripts/memory_math.py`; exercises in `resume/study/memory-math.md` | if a Baseten or LawZero round asks for it | Two traces, the MFU number and the peak with/without checkpointing, in the README |
 
 **Slip rules.** An interview booked inside a milestone takes that milestone's slot; push the chain
 back. Never drop M1 or M4: they carry the Handshake story. If a week behind, cut M7, then M3's DPO
 row, then M5.
 
 **Deferred until after the interviews:** rung 2 (HealthBench with an API judge on ~50
-conversations) → stage C (SGLang in-place weight updates) → verl on Modal → arms A/B/C →
+conversations) → stage C (SGLang in-place weight updates) → Miles on Modal (2 × 8 H100) → arms A/B/C →
 MentalHealthBench transfer → MoE stage → frameworks notes.
 
 ## Design
 
 ### Stack
 
-- **`nano/`** (yours): a verl-shaped trainer in pure PyTorch, then Ray. The learning artifact and the
+- **`nanorft`** (yours): a verl-shaped trainer in pure PyTorch, then Ray. The learning artifact and the
   local path. Roles, each a Ray actor in stage B: `Driver` (the loop, holds no weights),
   `Generator` (sampling → token ids + logprobs), `Learner` (weights, optimizer, loss; Tinker API),
   `Reference` (frozen logprobs for KL, optional), `Reward`. One batch type, a dict of tensors
   (`input_ids`, `attention_mask`, `response_mask`, `old_logprobs`, `ref_logprobs`, `rewards`,
   `advantages`) plus metadata: your `DataProto`.
-- **verl on a single Modal node** for the real runs, from Modal's `grpo_verl` example
-  (https://modal.com/docs/examples/grpo_verl) with a current image and
-  `actor_rollout_ref.rollout.name=sglang`. No multi-node: a 2–4B policy fits one node; multi-node is
-  a sentence in the README's "with more compute".
+- **Ray on Modal, one app for every scale** (`modal/ray_cluster.py`). An *entry* is a plain
+  `main(cfg) -> dict` that finds Ray already connected; the same code runs on the Mac. One node
+  (1–8 H100s): one container with a local Ray instance sized to its reservation (the
+  mila-logo-segmentation pattern). Two nodes: a Clustered Function with RDMA, bring-up after
+  Modal's Miles example (https://modal.com/docs/examples/miles_grpo). Rank 0 starts the Ray head
+  and waits for all 16 GPUs, rank 1 joins and blocks on a `modal.Queue` until rank 0 is done.
+  The image installs from the same `uv.lock` as the Mac. `nanorft/cluster_check.py` (`--entry check`)
+  times an NCCL all-reduce across every GPU: run it before any multi-node run, and check
+  `NET/IB` (RDMA) vs `NET/Socket` in the NCCL logs.
+- **Miles for the scaled runs** (FSDP backend, colocated SGLang rollouts, TIS), from Modal's
+  `miles_grpo` example: a tested 2 × 8-GPU recipe on the same Ray bring-up. **verl is read on
+  the side** (its docs and `core_algos.py` vocabulary, table below). verl on 2 × 8 would work on
+  the same bring-up if Miles doesn't fit.
 - **SGLang** wherever an engine is needed (stage C generator, verl rollouts, judge, serving). You run
   vLLM at work; this is where you learn the second engine. Fit: RadixAttention prefix caching (a
   GRPO group shares a prompt; the judge grades one response against 10–40 criteria), in-place weight
   updates (the Learner → Generator sync), constrained decoding for the verdict JSON. Neither engine
   runs on Apple Silicon: stages A–B use HF `generate`.
-- **Shared library `rl_finetune/`:** data, rewards, judge client, tracking. No trainer imports, so
-  `nano/` and verl both use it.
+- **One package, `src/nanorft/`.** `nanorft.data`, `.rewards`, `.judge` and `.tracking` never import
+  trainer modules, so a Miles run can use the same data, rewards and judge.
 - **Tracking: W&B** (free for personal projects, native in verl, zero ops), behind
-  `rl_finetune/tracking.py`. MLflow on Modal only if you want the self-hosting practice.
+  `nanorft/tracking.py`. MLflow on Modal only if you want the self-hosting practice.
 
 ### Rules that prevent the classic bugs
 
@@ -129,8 +138,8 @@ Checked on the Hub 24 Sep 2026: Qwen3.6 only ships 27B and 35B-A3B; Qwen3.5 has 
 
 | Use | Model | Note |
 |---|---|---|
-| Local `nano/` (Mac) | **Qwen3.5-0.8B** instruct | Its Gated DeltaNet layers may fall back to a slow path on MPS. **M0 timing check** (`scripts/time_model.py`, fwd+bwd at 4 × 256 tokens): over ~5 s/step → Qwen2.5-0.5B-Instruct or SmolLM2-360M. The loop is what you're learning |
-| First Modal runs (verl, 2× H100) | **Qwen3.5-2B → 4B** | Dense, full FT under FSDP; where the three arms run first |
+| Local `nanorft` (Mac) | **Qwen3.5-0.8B** instruct | M0 timing (`scripts/time_model.py`, fwd+bwd+AdamW at 4 × 256 tokens, MPS): **3.1 s/step, 13.5 GB** (torch fallback for Gated DeltaNet); Qwen2.5-0.5B-Instruct 1.05 s/step, 9.1 GB. Under the ~5 s/step rule; fall back to 0.5B if the generator OOMs next to the learner |
+| First Modal runs (Miles, 2 × 8 H100) | **Qwen3.5-2B → 4B** | Dense, full FT under FSDP; where the three arms run first. Check that Miles' FSDP backend and SGLang support Qwen3.5's Gated DeltaNet layers; else Qwen3-4B (the example's model). On CUDA, install flash-linear-attention + causal-conv1d, or HF falls back to the slow torch path |
 | OPD teacher | Qwen3.6-27B or Qwen3.5-27B | Same tokenizer family (verify vocabs); dense keeps logprob serving simple |
 | Judge | ~30B open model, **different family** from the teacher | Avoids "judged by a relative of its teacher" |
 | MoE stage (later, 8× H100) | Qwen3.6-35B-A3B | LoRA or Megatron backend; only after the dense result exists |
@@ -160,13 +169,14 @@ deployment** and re-run after any version or prompt change.
 ## Repo layout (target) and what M0 deletes
 
 ```
-rl_finetune/   data/{schema,healthbench,mentalhealthbench,medqa}.py  rewards/{rubric,verifiers}.py
-               judge/client.py  tracking.py
-nano/          protocol.py algos.py generator.py learner.py reference.py reward_worker.py driver.py configs/
-modal/         images.py data_prep.py judge.py verl_grpo.py
+src/nanorft/   protocol.py algos.py generator.py learner.py reference.py reward_worker.py driver.py
+               cluster_check.py tracking.py
+               data/{arithmetic,schema,healthbench,mentalhealthbench,medqa}.py
+               rewards/{rubric,verifiers}.py  judge/client.py      (no __init__.py anywhere)
+configs/       run YAMLs
+modal/         ray_cluster.py miles_grpo.py data_prep.py judge.py   (no __init__.py: never shadows the SDK)
 analysis/      calibrate.py, plots
 scripts/       time_model.py memory_math.py
-notes/         journal.md decisions.md profiling.md verl/ frameworks.md
 ```
 
 **Delete in M0** (all in tag `v0-trl-llamacpp`): `train.py`, `rollout.py`, `export.py`, `cli.py`,
@@ -189,8 +199,9 @@ Paths move between releases; check the version you pin.
 | M7 driver, roles | `verl/trainer/ppo/ray_trainer.py` (`fit`), `verl/single_controller/`, `verl/workers/fsdp_workers.py` | Step order; one controller fanning out to N workers; the hybrid engine |
 | Stage C weight sync | the rollout sharding manager under `verl/workers/` | Object-store sync vs in-place resharding |
 | Background | HybridFlow paper; verl programming guide | Single controller + multi-controller workers |
+| Scaled runs (Miles) | Modal's `miles_grpo` example; Miles `train.py` and its Ray actor groups | Colocated train/rollout, weight push to SGLang, TIS vs verl's rollout correction |
 
-`notes/frameworks.md` (later): verl vs slime/Miles vs SkyRL vs OpenRLHF, one page each on the
+Frameworks comparison (later, in the resume repo's `study/`): verl vs slime/Miles vs SkyRL vs OpenRLHF, one page each on the
 controller model, rollout/training GPU split, weight sync, async, MoE. Design comparison, not
 throughput; nothing from AlayaCare.
 
@@ -206,12 +217,11 @@ ask.
 ## Definition of done (public v1)
 
 - [ ] Public, MIT licence, README honest about current state
-- [ ] `nano/` stages A–B working locally; rung-1 reward rising
+- [ ] `nanorft` stages A–B working locally; rung-1 reward rising
 - [ ] HealthBench data + criteria split + rubric reward with caching
 - [ ] Judge-vs-physician agreement (κ / F1 + Brier / ECE) in the README
 - [ ] Rung-1 table: SFT vs DPO vs GRPO vs OPD
 - [ ] `modal/` judge app with pinned versions
-- [ ] `notes/`: journal, decisions, verl notes
 - [ ] v1.1: arm A decomposition; arms B/C; MentalHealthBench transfer
 
 ## After v1

@@ -10,9 +10,6 @@ dist/
 build/
 *.egg
 
-# uv
-uv.lock
-
 # Models and checkpoints (large files)
 models/
 checkpoints/
@@ -25,19 +22,20 @@ merged_model_tmp/
 # Environment
 .env
 
-# Editor
+# Editor and tools
 .vscode/
 .idea/
+.claude/
+.pytest_cache/
+.ruff_cache/
 *.swp
 *.swo
 
 # macOS
 .DS_Store
 
-# Promptfoo
-.promptfoo/
-promptfoo-output.json
-
-# Logs
+# Runs, caches, outputs
+wandb/
+.cache/
+analysis/out/
 *.log
-trainer_log.jsonl
