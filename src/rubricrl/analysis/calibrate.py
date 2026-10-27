@@ -45,7 +45,13 @@ from rubricrl.judge.client import (
     VerdictCache,
     cache_key,
 )
-from rubricrl.judge.prompt import render
+from rubricrl.judge.prompt import (
+    PROMPT_VERSION,
+    TEMPLATES,
+    TRAJECTORY_VERSION,
+    render,
+    render_transcript,
+)
 
 OUT = Path("analysis/out/calibration")
 
@@ -130,7 +136,9 @@ def cohen_kappa(a: Sequence[bool], b: Sequence[bool]) -> float | None:
 def by_length(
     judgments: Sequence[Judgment], labels: Sequence[bool | None], buckets: int = 4
 ) -> list[dict]:
-    """Balanced F1 per completion-length quantile bucket."""
+    """Balanced F1 per completion-length quantile bucket, and how often the
+    judge and the physicians say "met" in it (a judge that turns lenient on long
+    completions faster than physicians do rewards length)."""
     order = sorted(range(len(judgments)), key=lambda i: len(judgments[i].completion))
     rows = []
     for b in range(buckets):
@@ -138,6 +146,7 @@ def by_length(
         js = [judgments[i] for i in idx]
         m = judge_metrics(js, [labels[i] for i in idx]).get("overall", {})
         lens = [len(j.completion) for j in js]
+        given = [labels[i] for i in idx if labels[i] is not None]
         rows.append(
             {
                 "bucket": b,
@@ -145,6 +154,10 @@ def by_length(
                 "chars_max": max(lens),
                 "n": len(js),
                 "f1_balanced": m.get("f1_balanced"),
+                "judge_rate_met": sum(given) / len(given) if given else None,
+                "physician_rate_met": statistics.fmean(
+                    x for j in js for x in j.physician_labels
+                ),
             }
         )
     return rows
@@ -200,20 +213,89 @@ def estimate(judgments: Sequence[Judgment]) -> dict[str, float]:
     }
 
 
+def confusion(
+    judgments: Sequence[Judgment], labels: Sequence[bool | None]
+) -> dict[str, int]:
+    """Judge vs the physicians' majority, on items with a majority and a verdict."""
+    out = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
+    for j, label in zip(judgments, labels, strict=True):
+        votes = Counter(j.physician_labels)
+        if label is None or votes[True] == votes[False]:
+            continue
+        majority = votes[True] > votes[False]
+        out[("t" if label == majority else "f") + ("p" if label else "n")] += 1
+    return out
+
+
+GRADERS = ("response", "trajectory")
+
+
+def grader_prompt(
+    j: Judgment, grader: str = "response", template: str | None = None
+) -> str:
+    """The judge prompt for one judgment: simple-evals' (the last reply), or the
+    simulated-consultation one (the replies after a marker; here, the one reply).
+    `template`: another response template (an optimized one, `judge/optimize.py`)."""
+    if grader == "trajectory":
+        turn = [{"role": "assistant", "content": j.completion}]
+        return render_transcript(j.messages, turn, j.rubric)
+    if template is not None:
+        return render(j.messages, j.completion, j.rubric, template)
+    return render(j.messages, j.completion, j.rubric)
+
+
+class TrajectoryGrading:
+    """A judge whose `grade` uses the trajectory prompt: calibrates the grader the
+    simulated consultations use (`rubricrl.env`, patient mode) on the meta-eval."""
+
+    def __init__(self, judge):
+        self.judge, self.config, self.usage = judge, judge.config, judge.usage
+
+    async def grade(self, messages, completion, rubric_item, repeat=0):
+        turn = [{"role": "assistant", "content": completion}]
+        prompt = render_transcript(messages, turn, rubric_item)
+        return await self.judge.grade_prompt(prompt, repeat)
+
+
+class TemplateGrading:
+    """A judge whose `grade` uses another response template (`judge/optimize.py`)."""
+
+    def __init__(self, judge, template: str):
+        self.judge, self.config, self.usage = judge, judge.config, judge.usage
+        self.template = template
+
+    async def grade(self, messages, completion, rubric_item, repeat=0):
+        prompt = render(messages, completion, rubric_item, self.template)
+        return await self.judge.grade_prompt(prompt, repeat)
+
+
 def cache_coverage(
-    config: JudgeConfig, subset: Sequence[Judgment], retest: int, cache: VerdictCache
+    config: JudgeConfig,
+    subset: Sequence[Judgment],
+    retest: int,
+    cache: VerdictCache,
+    grader: str = "response",
+    template: str | None = None,
 ) -> tuple[int, int]:
     """(verdicts already cached, verdicts the run needs)."""
     keys = [
-        cache_key(config, render(j.messages, j.completion, j.rubric), repeat)
+        cache_key(config, grader_prompt(j, grader, template), repeat)
         for repeat, items in ((0, subset), (1, subset[:retest]))
         for j in items
     ]
     return sum(cache.get(k) is not None for k in keys), len(keys)
 
 
-def label(config: JudgeConfig) -> str:
-    return f"{config.model}-{config.effort}" + ("-thinking" if config.thinking else "")
+def label(
+    config: JudgeConfig, grader: str = "response", prompt_version: str | None = None
+) -> str:
+    """`prompt_version`: an optimized template's name (none: simple-evals')."""
+    return (
+        f"{config.model}-{config.effort}"
+        + ("-thinking" if config.thinking else "")
+        + ("-trajectory" if grader == "trajectory" else "")
+        + (f"-{prompt_version}" if prompt_version else "")
+    )
 
 
 async def run(
@@ -229,31 +311,62 @@ async def run(
     out: Path = OUT,
     weave_project: str | None = None,
     require_cached: bool = False,
+    wandb_project: str | None = None,
+    grader: str = "response",
+    template: Path | None = None,
+    prompt_version: str | None = None,
 ) -> dict:
     """Grade `n` judgments (and the first `retest` again); write the result JSON.
 
     `weave_project`: also log the run to W&B Weave (`rubricrl.observe`).
     `require_cached`: stop before any API call unless every verdict is cached.
+    `grader`: "response" (simple-evals' prompt) or "trajectory" (the simulated
+    consultations' prompt, `judge.prompt.TRAJECTORY_TEMPLATE`).
+    `template`: a response template file instead of simple-evals' (an optimized
+    one, `judge/optimize.py`), named `prompt_version` (default: the file's stem).
+    `prompt_version` alone: a built-in template (`judge.prompt.TEMPLATES`).
     """
+    if (template is not None or prompt_version) and grader == "trajectory":
+        raise ValueError("--template / --prompt-version: response grader only")
+    if prompt_version == PROMPT_VERSION:
+        prompt_version = None  # simple-evals': no suffix, as before
+    text = Path(template).read_text() if template is not None else None
+    if text is not None:
+        prompt_version = prompt_version or Path(template).stem
+    elif prompt_version:  # a built-in template (judge.prompt.TEMPLATES)
+        if prompt_version not in TEMPLATES:
+            raise ValueError(f"unknown prompt version {prompt_version!r}")
+        text = TEMPLATES[prompt_version]
+    version = prompt_version or (
+        TRAJECTORY_VERSION if grader == "trajectory" else PROMPT_VERSION
+    )
     all_judgments = healthbench.load_judgments(root)
     subset = sample_judgments(all_judgments, n, seed)
     config = JudgeConfig.named(
         judge_name, effort=effort, thinking=thinking, concurrency=concurrency
     )
+    name = label(config, grader, prompt_version)
     verdict_cache = VerdictCache(cache) if cache else VerdictCache()
-    hits, needed = cache_coverage(config, subset, retest, verdict_cache)
-    print(f"{label(config)}: {hits}/{needed} verdicts cached")
+    hits, needed = cache_coverage(config, subset, retest, verdict_cache, grader, text)
+    print(f"{name}: {hits}/{needed} verdicts cached")
     if require_cached and hits < needed:
         raise SystemExit(f"{needed - hits} verdicts not cached (--require-cached)")
     judge = ClaudeJudge(config, verdict_cache)
+    if grader == "trajectory":
+        judge = TrajectoryGrading(judge)
+    elif text is not None:
+        judge = TemplateGrading(judge, text)
     grade = None
     if weave_project:  # a trace per completion, its judge calls as children
         from rubricrl import observe
 
         observe.init(weave_project)
         dataset = observe.publish_judgments(subset, seed)
+        prompt_ref = (
+            observe.publish_prompt(text, version) if text else observe.publish_prompt()
+        )
         attributes = observe.run_attributes(
-            label(config), config, len(subset), seed, observe.publish_prompt()
+            name, config, len(subset), seed, prompt_ref, version
         )
         grade = observe.traced_grader(judge, attributes)
     print(
@@ -271,7 +384,9 @@ async def run(
     ]
     result = {
         "model": config.model,
-        "label": label(config),
+        "label": name,
+        "grader": grader,
+        "prompt_version": version,
         "effort": config.effort,
         "thinking": config.thinking,
         "n": len(subset),
@@ -287,6 +402,7 @@ async def run(
             "kappa": cohen_kappa([a for a, _ in both], [b for _, b in both]),
         },
         "by_length": by_length(subset, labels),
+        "confusion": confusion(subset, labels),
         "judge_rate_met": sum(bool(x) for x in labels)
         / max(1, sum(x is not None for x in labels)),
         "physician_rate_met": statistics.fmean(
@@ -301,8 +417,21 @@ async def run(
             result, attributes, dataset
         )
         print(f"weave: {result['weave_url']}")
+    if wandb_project:
+        from rubricrl import observe
+
+        run_config = {
+            "judge": judge_name, "model": config.model, "effort": config.effort,
+            "thinking": config.thinking, "grader": grader,
+            "prompt_version": version, "template": str(template or ""),
+            "n": len(subset), "seed": seed, "retest": retest,
+        }  # fmt: skip
+        result["wandb_url"] = observe.log_wandb_calibration(
+            wandb_project, result, run_config
+        )
+        print(f"wandb: {result['wandb_url']}")
     out.mkdir(parents=True, exist_ok=True)
-    path = out / f"{label(config)}-n{len(subset)}.json"
+    path = out / f"{name}-n{len(subset)}.json"
     path.write_text(json.dumps(result, indent=1))
     print(f"wrote {path}; cost ${result['usage']['cost_usd']}")
     return result
@@ -407,8 +536,99 @@ def estimate_cmd(n: int, seed: int, root: Path) -> None:
 @click.option(
     "--require-cached", is_flag=True, help="stop unless every verdict is cached"
 )
+@click.option(
+    "--wandb", "wandb_project", default=None, help="also log a W&B run to this project"
+)
+@click.option(
+    "--grader",
+    type=click.Choice(GRADERS),
+    default="response",
+    show_default=True,
+    help="the judge prompt: simple-evals' or the simulated consultations'",
+)
+@click.option(
+    "--template",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="a response template file instead of simple-evals' (judge/optimize.py)",
+)
+@click.option(
+    "--prompt-version",
+    default=None,
+    help="a built-in template (e.g. gepa-v1), or --template's name (default: stem)",
+)
 def run_cmd(**kwargs) -> None:
     asyncio.run(run(**kwargs))
+
+
+def _results(paths: Sequence[Path]) -> list[dict]:
+    results = [json.loads(Path(p).read_text()) for p in paths]
+    if len({(r["n"], r["seed"]) for r in results}) != 1:
+        raise click.UsageError("results must be on the same judgments (n, seed)")
+    return results
+
+
+def vote(results: Sequence[dict], root: Path = healthbench.RAW) -> dict:
+    """The majority label across judges (or prompts) on the same judgments: if it
+    beats each one alone, their errors differ and an ensemble would help."""
+    subset = sample_judgments(
+        healthbench.load_judgments(root), results[0]["n"], results[0]["seed"]
+    )
+    labels = []
+    for j in subset:
+        votes = [r["labels"][j.id] for r in results if r["labels"][j.id] is not None]
+        labels.append(None if not votes else 2 * sum(votes) > len(votes))
+    alone = {r["label"]: r["judge"]["overall"]["f1_balanced"] for r in results}
+    pairs = [
+        sum(a["labels"][j.id] == b["labels"][j.id] for j in subset) / len(subset)
+        for i, a in enumerate(results)
+        for b in results[i + 1 :]
+    ]
+    return {
+        "alone": alone,
+        "vote": judge_metrics(subset, labels)["overall"]["f1_balanced"],
+        "vote_rate_met": sum(bool(x) for x in labels) / len(labels),
+        "mean_pairwise_agreement": statistics.fmean(pairs) if pairs else None,
+    }
+
+
+def lengths(results: Sequence[dict], root: Path = healthbench.RAW) -> list[dict]:
+    """`by_length` (with the rates of "met") for each result, from its labels."""
+    subset = sample_judgments(
+        healthbench.load_judgments(root), results[0]["n"], results[0]["seed"]
+    )
+    return [
+        {"label": r["label"],
+         "buckets": by_length(subset, [r["labels"][j.id] for j in subset])}
+        for r in results
+    ]  # fmt: skip
+
+
+@main.command("vote")
+@click.argument("paths", nargs=-1, required=True, type=click.Path(exists=True))
+def vote_cmd(paths) -> None:
+    """Majority vote across calibration results on the same judgments."""
+    print(json.dumps(vote(_results(paths)), indent=1))
+
+
+@main.command("lengths")
+@click.argument("paths", nargs=-1, required=True, type=click.Path(exists=True))
+def lengths_cmd(paths) -> None:
+    """Per length quartile: balanced F1 and the judge's vs physicians' rate of
+    "met", for each calibration result."""
+    rows = lengths(_results(paths))
+    b0 = rows[0]["buckets"]
+    print("| Judge | " + " | ".join(
+        f"{b['chars_min']}–{b['chars_max']} chars" for b in b0) + " |")  # fmt: skip
+    print("|---" * (len(b0) + 1) + "|")
+    phys = " | ".join(f"{b['physician_rate_met']:.2f}" for b in b0)
+    print(f"| Physicians, rate met | {phys} |")
+    for r in rows:
+        cells = " | ".join(
+            f"{_f(b['judge_rate_met'])} (F1 {_f(b['f1_balanced'])})"
+            for b in r["buckets"]
+        )
+        print(f"| {r['label']} | {cells} |")
 
 
 @main.command("report")

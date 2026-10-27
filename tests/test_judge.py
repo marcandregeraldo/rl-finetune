@@ -134,3 +134,33 @@ def test_grade_criteria_with_fake_judge():
     verdicts = asyncio.run(judge.grade_criteria(MESSAGES, "A", criteria))
     assert [v.met for v in verdicts] == [True, False]
     assert "[-3] Says B" in judge.prompts[1]
+
+
+def test_prompt_versions_pick_the_template():
+    cfg = JudgeConfig.named("haiku", prompt_version=prompt.GEPA_V1_VERSION)
+    judge = ClaudeJudge(cfg)
+    assert judge.template == prompt.GEPA_V1_TEMPLATE
+    assert ClaudeJudge(JudgeConfig()).template == prompt.GRADER_TEMPLATE
+    with pytest.raises(ValueError, match="unknown prompt version"):
+        JudgeConfig(prompt_version="nope")
+    # The reward's default is the optimized template.
+    assert prompt.REWARD_PROMPT_VERSION == prompt.GEPA_V1_VERSION
+    p = prompt.render(MESSAGES, "No.", "[5] Says no.", judge.template)
+    assert "physician reviewer" in p and p.endswith("Do not include any other text.")
+    assert "user: Is smoking good for me?\n\nassistant: No." in p
+
+
+def test_reward_judge_uses_the_reward_prompt(monkeypatch):
+    from rubricrl.rewards import miles_rm
+
+    monkeypatch.setattr(miles_rm, "_judges", {})
+    monkeypatch.setattr(miles_rm, "_cache", object())
+    monkeypatch.delenv("RUBRICRL_PROMPT", raising=False)
+
+    async def configs():
+        return miles_rm._judge().config
+
+    assert asyncio.run(configs()).prompt_version == prompt.GEPA_V1_VERSION
+    monkeypatch.setattr(miles_rm, "_judges", {})
+    monkeypatch.setenv("RUBRICRL_PROMPT", prompt.PROMPT_VERSION)
+    assert asyncio.run(configs()).prompt_version == prompt.PROMPT_VERSION

@@ -34,7 +34,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from rubricrl.data.schema import Criterion
-from rubricrl.judge.prompt import PROMPT_VERSION, VERDICT_SCHEMA, render
+from rubricrl.judge.prompt import (
+    GRADER_TEMPLATE,
+    PROMPT_VERSION,
+    TEMPLATES,
+    VERDICT_SCHEMA,
+    render,
+    render_transcript,
+)
 
 MODELS = {"haiku": "claude-haiku-5-5", "sonnet": "claude-sonnet-5-5"}
 # $ per million tokens (input, output), prompts under 100K tokens.
@@ -67,6 +74,17 @@ class JudgeConfig:
     max_tokens: int = 4096  # a cap; thinking needs the room
     concurrency: int = 32  # requests in flight
     max_attempts: int = 3  # per verdict, on refusal / truncation / API errors
+    prompt_version: str = PROMPT_VERSION  # the response template (prompt.TEMPLATES)
+
+    def __post_init__(self):
+        if self.prompt_version not in TEMPLATES:
+            raise ValueError(
+                f"unknown prompt version {self.prompt_version!r}: {sorted(TEMPLATES)}"
+            )
+
+    @property
+    def template(self) -> str:
+        return TEMPLATES[self.prompt_version]
 
     @classmethod
     def named(cls, name: str, **kw) -> JudgeConfig:
@@ -173,6 +191,8 @@ class VerdictCache:
 
 
 def cache_key(config: JudgeConfig, prompt: str, repeat: int = 0) -> str:
+    """The full prompt is in the key, so the template is too. PROMPT_VERSION stays
+    a constant here: keys made before templates had versions still match."""
     parts = [
         config.model,
         config.effort,
@@ -187,13 +207,16 @@ def cache_key(config: JudgeConfig, prompt: str, repeat: int = 0) -> str:
 class _Grader:
     """What every judge offers on top of `grade_prompt`."""
 
+    template: str = GRADER_TEMPLATE  # the response template `grade` renders
+
     async def grade_prompt(self, prompt: str, repeat: int = 0) -> Verdict:
         raise NotImplementedError
 
     async def grade(
         self, messages: list[dict], response: str, rubric_item: str, repeat: int = 0
     ) -> Verdict:
-        return await self.grade_prompt(render(messages, response, rubric_item), repeat)
+        prompt = render(messages, response, rubric_item, self.template)
+        return await self.grade_prompt(prompt, repeat)
 
     async def grade_criteria(
         self,
@@ -208,6 +231,23 @@ class _Grader:
             )
         )
 
+    async def grade_transcript(
+        self,
+        opening: list[dict],
+        turns: list[dict],
+        criteria: Sequence[Criterion],
+        repeat: int = 0,
+    ) -> list[Verdict]:
+        """Each criterion over a whole simulated consultation (trajectory-v1)."""
+        return list(
+            await asyncio.gather(
+                *(
+                    self.grade_prompt(render_transcript(opening, turns, str(c)), repeat)
+                    for c in criteria
+                )
+            )
+        )
+
 
 class ClaudeJudge(_Grader):
     def __init__(
@@ -217,6 +257,7 @@ class ClaudeJudge(_Grader):
         client=None,
     ):
         self.config = config or JudgeConfig()
+        self.template = self.config.template
         self.cache = cache
         self.usage = Usage()
         self._client = client

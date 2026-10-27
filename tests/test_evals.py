@@ -80,3 +80,9 @@ def test_score_and_compare(tmp_path, monkeypatch):
     out = run.compare(base, new)
     assert "| haiku | 0.750" in out
     assert "| Run | Judge |" in run.table([base, new])
+
+
+def test_parse_judge_specs():
+    assert run.parse_judge("haiku@gepa-v1") == ("haiku", "gepa-v1", None)
+    assert run.parse_judge("sonnet:1") == ("sonnet", None, 1)
+    assert run.parse_judge("haiku@gepa-v1:2") == ("haiku", "gepa-v1", 2)

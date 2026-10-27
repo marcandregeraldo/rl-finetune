@@ -10,12 +10,14 @@ What separates learning the task from learning the grader is in `compare`:
 
 - **gain on training criteria vs gain on held-out criteria.** The two halves have
   different criteria, so compare their *gains*, not their levels.
-- **gain under the training judge (Haiku) vs under the held-out judge (Sonnet).**
+- **gain under the training judge (Haiku with the reward's prompt, gepa-v1) vs
+  under the held-out judge (Sonnet with simple-evals' prompt): another model and
+  another prompt, so a policy that games either one shows up.**
 
 CIs are 95% bootstrap over conversations (a conversation's K samples averaged
 first); `compare` pairs conversations.
 
-    python -m rubricrl.evals.run score runs/samples/qwen3.5-4b.jsonl   # haiku, sonnet:1
+    python -m rubricrl.evals.run score runs/samples/qwen3.5-4b.jsonl  # default judges
     python -m rubricrl.evals.run table runs/evals/qwen3.5-4b runs/evals/rft-60
     python -m rubricrl.evals.run compare runs/evals/qwen3.5-4b runs/evals/rft-60
 """
@@ -26,6 +28,7 @@ import statistics
 import time
 from collections import defaultdict
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 
 import click
@@ -39,7 +42,18 @@ from rubricrl.rewards.miles_rm import clean_response
 from rubricrl.rewards.rubric import axis_scores, clipped_mean, score
 
 OUT = Path("runs/evals")
-DEFAULT_JUDGES = ("haiku", "sonnet:1")  # Sonnet on sample 0 only: ~15x the price
+# "model[@prompt version][:K]": "haiku@gepa-v1" is the reward's judge; "sonnet:1"
+# (simple-evals' prompt) grades sample 0 only, at ~15x the price.
+DEFAULT_JUDGES = ("haiku@gepa-v1", "sonnet:1")
+
+
+def parse_judge(spec: str) -> tuple[str, str | None, int | None]:
+    """'haiku@gepa-v1:2' -> ('haiku', 'gepa-v1', 2)."""
+    rest, _, k = spec.partition(":")
+    model, _, version = rest.partition("@")
+    return model, version or None, int(k) if k else None
+
+
 HALVES = ("full", "train", "heldout")
 N_BOOT = 2000
 
@@ -192,11 +206,14 @@ async def score_file(
     ]
     usage = {}
     for spec in judges:
-        judge_name, _, k = spec.partition(":")  # "sonnet:1": sample 0 only
-        config = JudgeConfig.named(judge_name, concurrency=concurrency)
+        model, version, k = parse_judge(spec)
+        judge_name = spec.partition(":")[0]  # "haiku@gepa-v1", "sonnet"
+        config = JudgeConfig.named(model, concurrency=concurrency)
+        if version:
+            config = replace(config, prompt_version=version)
         judge = ClaudeJudge(config, verdicts)
         pairs = zip(records, samples, strict=True)
-        mine = [(r, s) for r, s in pairs if not k or s["sample"] < int(k)]
+        mine = [(r, s) for r, s in pairs if k is None or s["sample"] < k]
         print(f"judge {config.model}: {len(mine)} responses")
         mets = await score_samples([s for _, s in mine], examples, judge)
         for (rec, s), met in zip(mine, mets, strict=True):
@@ -341,7 +358,7 @@ def main() -> None:
     multiple=True,
     default=DEFAULT_JUDGES,
     show_default=True,
-    help="haiku | sonnet, repeatable; 'sonnet:1' grades sample 0 only",
+    help="model[@prompt][:K], repeatable: 'haiku@gepa-v1', 'sonnet:1' (sample 0)",
 )
 @click.option("--max-samples", type=int, default=None, help="use samples 0..K-1 only")
 @click.option("--name", default=None, help="output dir name (default: samples stem)")

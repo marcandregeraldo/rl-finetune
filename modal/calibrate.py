@@ -20,10 +20,13 @@ Then (prefix with `uv run`):
     modal run modal/calibrate.py --backfill          # the 4 README runs, $0: cached
     modal run modal/calibrate.py --judge haiku --effort medium --thinking --n 1000
     modal run modal/calibrate.py --judge sonnet --n 1000 --retest 100
+    modal run modal/calibrate.py --grader trajectory --n 1000    # the v2 grader prompt
+    modal run modal/calibrate.py --effort low --n 1000 \
+        --template analysis/out/optimize/gepa-v1/gepa-v1.txt   # an optimized prompt
 
 `--backfill` requires every verdict to be cached (it stops before any API call
-otherwise) and keeps the local result JSONs, adding only their `weave_url`: their
-usage and cost are those of the original runs.
+otherwise) and keeps the local result JSONs, adding only their Weave and W&B
+links: their usage and cost are those of the original runs.
 """
 
 import json
@@ -75,7 +78,15 @@ judge_volume = modal.Volume.from_name("rubricrl-judge", create_if_missing=True)
     memory=4096,
     timeout=120 * MINUTES,
 )
-def calibrate(options: dict, weave_project: str = WEAVE_PROJECT) -> dict:
+def calibrate(
+    options: dict, weave_project: str = WEAVE_PROJECT, git: dict | None = None
+) -> dict:
+    """One calibration run; also a W&B run (`job_type="calibration"`) in the same
+    project, with the Mac's git commit in its config."""
+    import os
+
+    for k, v in (git or {}).items():
+        os.environ[k] = v
     import asyncio
     import shutil
 
@@ -86,6 +97,9 @@ def calibrate(options: dict, weave_project: str = WEAVE_PROJECT) -> dict:
     raw = JUDGE / "raw"
     healthbench.download(raw, ["meta_eval"])  # sha256-checked; skipped if present
     work = Path(tempfile.mkdtemp())
+    if text := options.pop("template_text", None):  # --template, sent as text
+        options["template"] = work / f"{options['prompt_version']}.txt"
+        options["template"].write_text(text)
     cache = VerdictCache(work / "judge.sqlite")
     for name in ("judge.sqlite", "incoming.sqlite"):  # incoming: the Mac's
         if (JUDGE / name).exists():
@@ -99,6 +113,7 @@ def calibrate(options: dict, weave_project: str = WEAVE_PROJECT) -> dict:
             root=raw,
             out=JUDGE / "calibration",
             weave_project=weave_project,
+            wandb_project=weave_project,
         )
     )
     cache.snapshot(work / "snapshot.sqlite")
@@ -106,6 +121,21 @@ def calibrate(options: dict, weave_project: str = WEAVE_PROJECT) -> dict:
     (JUDGE / "incoming.sqlite").unlink(missing_ok=True)
     judge_volume.commit()
     return result
+
+
+def _git() -> dict:
+    """This checkout's commit, for the run's config (no git inside the container)."""
+    import subprocess
+
+    def out(*cmd: str) -> str:
+        return subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT).stdout
+
+    return {
+        "RUBRICRL_GIT_SHA": out("git", "rev-parse", "HEAD").strip(),
+        "RUBRICRL_GIT_DIRTY": "1"
+        if out("git", "status", "--porcelain").strip()
+        else "0",
+    }
 
 
 def _push_cache() -> None:
@@ -134,14 +164,14 @@ def _pull_cache() -> None:
 
 
 def _save(result: dict, keep_existing: bool) -> Path:
-    """Write the result JSON locally; with `keep_existing`, only add `weave_url`."""
+    """Write the result JSON locally; with `keep_existing`, only add the links."""
     path = OUT / f"{result['label']}-n{result['n']}.json"
     OUT.mkdir(parents=True, exist_ok=True)
     if keep_existing and path.exists():
         old = json.loads(path.read_text())
         same = old["labels"] == result["labels"]
         print(f"{path.name}: labels {'match' if same else 'DIFFER from'} the original")
-        result = old | {"weave_url": result.get("weave_url")}
+        result = old | {k: result.get(k) for k in ("weave_url", "wandb_url")}
     path.write_text(json.dumps(result, indent=1))
     return path
 
@@ -157,24 +187,36 @@ def main(
     concurrency: int = 32,
     require_cached: bool = False,
     backfill: bool = False,
+    grader: str = "response",
+    template: str = "",
+    prompt_version: str = "",
     sync_cache: bool = True,
     weave_project: str = WEAVE_PROJECT,
 ):
-    """One calibration run (the flags), or --backfill: the README's four."""
+    """One calibration run (the flags), or --backfill: the README's four.
+    `--template FILE`: a response template instead of simple-evals' (an optimized
+    one, `judge/optimize.py`), named `--prompt-version` (default: its stem)."""
     runs = BACKFILL if backfill else [(judge, effort, thinking, n, retest)]
     if sync_cache:
         _push_cache()
     keys = ("judge_name", "effort", "thinking", "n", "retest")
     for run in runs:
         options = dict(zip(keys, run, strict=True)) | {
+            "grader": "response" if backfill else grader,
             "seed": seed,
             "concurrency": concurrency,
             "require_cached": require_cached or backfill,
         }
-        result = calibrate.remote(options, weave_project)
+        if template and not backfill:
+            options |= {
+                "template_text": Path(template).read_text(),
+                "prompt_version": prompt_version or Path(template).stem,
+            }
+        result = calibrate.remote(options, weave_project, _git())
         path = _save(result, keep_existing=backfill)
         f1 = result["judge"]["overall"]["f1_balanced"]
         print(f"{result['label']} n={result['n']}: balanced F1 {f1:.3f} -> {path}")
         print(f"  weave: {result.get('weave_url')}")
+        print(f"  wandb: {result.get('wandb_url')}")
     if sync_cache:
         _pull_cache()
