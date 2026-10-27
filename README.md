@@ -13,6 +13,8 @@ health conversations, or better at the grader? The plan, milestones and design a
 | `configs/` | Run configs (YAML), from M1 |
 | `modal/ray_cluster.py` | Ray clusters on Modal (Modal's multi-node guide): experiments run as Ray Jobs on 1 node (1-8 H100s) or 2 clustered 8-GPU nodes with RDMA |
 | `scripts/` | `time_model.py` (step time + memory on this machine), `memory_math.py` (estimates) |
+| `docs/training-architecture.md` | How `nanorft` trains, documented as it's built |
+| `docs/diagrams/` | Architecture diagrams: `.excalidraw` sources and the rendered SVGs |
 
 ## Setup
 
@@ -35,3 +37,15 @@ uv run modal run --detach modal/ray_cluster.py --entry check --nodes 2
 
 The Modal image installs from the same `uv.lock` as the Mac. It needs the Modal
 secrets `wandb` and `huggingface-secret`.
+
+![Ray on Modal: the Mac spawns a 2-node clustered function; rank 0 runs the Ray head and submits the experiment as a Ray Job, rank 1 joins as a worker](docs/diagrams/ray-on-modal.svg)
+
+## Diagrams
+
+Sources are `docs/diagrams/*.excalidraw` (open and edit them on excalidraw.com; the font is
+Virgil). Re-render the SVG after an edit; fonts are embedded, so GitHub shows them:
+
+```bash
+npx -y mcp-excalidraw-server@2.1.2 render docs/diagrams/ray-on-modal.excalidraw \
+    --out docs/diagrams/ray-on-modal.svg
+```
