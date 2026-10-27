@@ -1,4 +1,4 @@
-"""Ray clusters on Modal for RL experiments: one node (1-8 GPUs) or two 8-GPU nodes.
+"""Ray clusters on Modal: one node (1-8 GPUs) or two 8-GPU nodes, and a cluster check.
 
 Follows Modal's multi-node training guide, Ray section
 (https://modal.com/docs/guide/multi-node-training): rank 0 starts the Ray head and
@@ -9,8 +9,9 @@ same head with no workers (Clustered Functions must take whole 8-GPU nodes, so
 
 An experiment is a module run as `python -m <module> --config <yaml>` that calls
 `ray.init()`, which joins this cluster. `--entry check` is
-`nanorft.cluster_check` (GPUs, versions, NCCL bandwidth), `--entry train` is
-`nanorft.driver` (M1), and any other value is taken as a module name.
+`rubricrl.cluster_check` (GPUs, versions, NCCL bandwidth); any other value is
+taken as a module name. Training itself runs in Miles' image with its own Ray
+bring-up (`modal/miles_rft.py`); this app checks the hardware and networking.
 
 Once: the Modal secrets `wandb` (WANDB_API_KEY) and `huggingface-secret`
 (HF_TOKEN). Then (prefix with `uv run`):
@@ -18,8 +19,6 @@ Once: the Modal secrets `wandb` (WANDB_API_KEY) and `huggingface-secret`
     modal run modal/ray_cluster.py --entry check                      # 1 GPU
     modal run modal/ray_cluster.py --entry check --gpus 8             # NVLink
     modal run --detach modal/ray_cluster.py --entry check --nodes 2   # RDMA
-    modal run --detach modal/ray_cluster.py --entry train \
-        --config configs/<config>.yaml --gpus 1                       # after M1
 
 `--dashboard` opens a public tunnel to the Ray dashboard (see `_head`).
 """
@@ -53,7 +52,7 @@ RUNS = Path("/runs")
 # as flash-linear-attention / causal-conv1d (Qwen3.5) later.
 CUDA_IMAGE = "nvidia/cuda:13.0.2-devel-ubuntu24.04"
 
-ENTRIES = {"check": "nanorft.cluster_check", "train": "nanorft.driver"}
+ENTRIES = {"check": "rubricrl.cluster_check"}
 
 app = modal.App(APP_NAME)
 
@@ -83,7 +82,7 @@ image = (
             "RAY_AUTH_MODE": "disabled",
         }
     )
-    .add_local_python_source("nanorft")
+    .add_local_python_source("rubricrl")
 )
 
 hf_vol = modal.Volume.from_name("rl-finetune-hf-cache", create_if_missing=True)
@@ -252,7 +251,7 @@ def main(
 ) -> None:
     """Run one experiment on a fresh Ray cluster.
 
-    --entry      check | train | a module name (run as `python -m`)
+    --entry      check | a module name (run as `python -m`)
     --config     a YAML file, read here; the run gets a copy in its run_dir
     --nodes      1 (one container, --gpus of them) or 2 (two 8-GPU nodes)
     --gpus       GPUs on the single node (1-8); ignored when --nodes 2

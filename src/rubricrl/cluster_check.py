@@ -6,18 +6,18 @@ RDMA: look for `NET/IB` (RDMA) vs `NET/Socket` (TCP) in the NCCL INFO lines, and
 the bus bandwidth (same definition as nccl-tests). It also prints the Python, torch
 and Ray versions the cluster runs, to compare with the Mac's (same uv.lock).
 
-    python -m nanorft.cluster_check [--config run.yaml]   # on any Ray cluster
+    python -m rubricrl.cluster_check [--config run.yaml]   # on any Ray cluster
 
 Submitted as a Ray Job by `modal/ray_cluster.py --entry check`. Config keys
 (optional): `mib` (all-reduce size, default 1024), `iters` (default 10).
 """
 
-import argparse
 import platform
 import socket
 import time
 from typing import Any
 
+import click
 import ray
 import yaml
 
@@ -100,10 +100,15 @@ def main(cfg: dict[str, Any]) -> dict[str, Any]:
     return summary
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--config", help="YAML file (optional keys: mib, iters)")
-    args = parser.parse_args()
-    cfg = yaml.safe_load(open(args.config)) if args.config else {}
+@click.command(help=__doc__.split("\n\n")[0])
+@click.option(
+    "--config", type=click.File(), help="YAML file (optional keys: mib, iters)"
+)
+def cli(config) -> None:
+    cfg = yaml.safe_load(config) if config else {}
     ray.init()  # inside a Ray Job: joins the cluster it was submitted to
     main(cfg or {})
+
+
+if __name__ == "__main__":
+    cli()

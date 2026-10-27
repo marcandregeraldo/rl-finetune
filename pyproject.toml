@@ -3,35 +3,36 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/nanorft"]
+packages = ["src/rubricrl"]
 
 [project]
 name = "rl-finetune"
 version = "0.1.0"
-description = "HealthBench RFT: the nanorft trainer locally, Ray clusters on Modal"
+description = "HealthBench rubric-reward RL: data, a calibrated Claude judge, evals, and GRPO with Miles on Modal"
 readme = "README.md"
 requires-python = ">=3.14,<3.15"
+# Data, judge, rewards and evals: no torch. The Miles image installs this package
+# with --no-deps on top of its own environment (see modal/miles_rft.py).
 dependencies = [
+    "anthropic>=1.0",
+    "click>=8.1",
+    "httpx>=0.27",
+    "huggingface-hub>=0.30",
+    "numpy>=2.0",
     "pyyaml>=6.0",
-    "python-dotenv>=1.0",
-    "rich>=13.0",
+    "tokenizers>=0.21",
 ]
 
 [project.optional-dependencies]
-# The trainer: local (MPS) and on Modal, where the image installs this same extra
-# from uv.lock.
+# The cluster check (modal/ray_cluster.py installs this extra from uv.lock) and
+# scripts/time_model.py. Training itself runs in the Miles image.
 train = [
     "torch>=2.6",
     "transformers>=4.57",
-    "peft>=0.17",
-    "accelerate>=1.0",
-    "datasets>=3.4",
     "ray[default]>=2.45",
-    "wandb>=0.19",
 ]
 modal = [
     "modal>=1.1",  # Image.uv_sync
-    "httpx>=0.27",
 ]
 
 [dependency-groups]
@@ -58,6 +59,7 @@ select = ["E", "W", "F", "I", "B", "UP"]
 
 [tool.ruff.lint.per-file-ignores]
 "scripts/memory_math.py" = ["E501"]  # wide table rows, kept readable
+"src/rubricrl/judge/prompt.py" = ["E501"]  # simple-evals' template, verbatim
 
 [tool.ruff.lint.isort]
 # modal/ (the Modal apps) would otherwise make the `modal` SDK look first-party.
