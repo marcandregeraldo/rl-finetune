@@ -87,6 +87,8 @@ class Verdict:
     explanation: str = ""
     cached: bool = False
     error: str | None = None
+    input_tokens: int = 0  # of the API call that produced it (cached: the original)
+    output_tokens: int = 0
 
 
 @dataclass
@@ -122,9 +124,17 @@ class VerdictCache:
     def get(self, key: str) -> Verdict | None:
         with self._lock:
             row = self._db.execute(
-                "SELECT met, explanation FROM verdicts WHERE key = ?", (key,)
+                "SELECT met, explanation, input_tokens, output_tokens FROM verdicts"
+                " WHERE key = ?",
+                (key,),
             ).fetchone()
-        return None if row is None else Verdict(bool(row[0]), row[1], cached=True)
+        if row is None:
+            return None
+        met, explanation, tokens_in, tokens_out = row
+        return Verdict(
+            bool(met), explanation, cached=True,
+            input_tokens=tokens_in or 0, output_tokens=tokens_out or 0,
+        )  # fmt: skip
 
     def put(self, key: str, model: str, v: Verdict, tokens: tuple[int, int]) -> None:
         with self._lock:
@@ -138,6 +148,28 @@ class VerdictCache:
     def __len__(self) -> int:
         with self._lock:
             return self._db.execute("SELECT COUNT(*) FROM verdicts").fetchone()[0]
+
+    def merge(self, other: Path | str) -> int:
+        """Add the verdicts of another cache file that this one lacks; how many."""
+        before = len(self)
+        with self._lock:
+            self._db.execute("ATTACH DATABASE ? AS other", (str(other),))
+            self._db.execute(
+                "INSERT OR IGNORE INTO verdicts SELECT key, model, met, explanation,"
+                " input_tokens, output_tokens, created FROM other.verdicts"
+            )
+            self._db.commit()
+            self._db.execute("DETACH DATABASE other")
+        return len(self) - before
+
+    def snapshot(self, path: Path | str) -> None:
+        """A consistent single-file copy (WAL included), for moving between hosts."""
+        dst = sqlite3.connect(path)
+        try:
+            with self._lock:
+                self._db.backup(dst)
+        finally:
+            dst.close()
 
 
 def cache_key(config: JudgeConfig, prompt: str, repeat: int = 0) -> str:
@@ -223,6 +255,7 @@ class ClaudeJudge(_Grader):
             if verdict.met is None:
                 error = verdict.error
                 continue
+            verdict.input_tokens, verdict.output_tokens = tokens
             if self.cache is not None:
                 self.cache.put(key, self.config.model, verdict, tokens)
             return verdict

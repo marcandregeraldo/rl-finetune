@@ -27,8 +27,9 @@ harness kept apart from the trainer.
 | M1 | **Data:** HealthBench pinned by sha256; conversation split and criteria split; Miles export; the eval subset frozen in `data/eval_ids.txt` | Claude | ✅ |
 | M2 | **Judge:** simple-evals' grader prompt; Claude via the API with structured output; SQLite cache; the rubric score | Claude | ✅ |
 | M3 | **Calibration** on `oss_meta_eval`: Haiku low, Haiku medium + thinking, Sonnet low, against the physician ceiling (README) | Claude | ✅ ~$11 of API |
+| M3b | **Calibration on Modal, in Weave:** `modal/calibrate.py --backfill` puts the 4 runs in Weave from the cache ($0); new judge configs run there too. Read the disagreements before M6 | you | ⬜ cents of Modal |
 | M4 | **Baselines:** `modal/sample.py`, then `evals/run.py`, for Qwen3.5-0.8B, Qwen3.5-4B and Qwen3.6-35B-A3B. The physician reference is done | you run Modal; scoring is local | ⬜ ~$8 Modal + ~$12 API per model |
-| M5 | **Smoke runs:** `miles_rft.py --task math --smoke-test`, then `--smoke-test` (HealthBench + judge). Measure step time here and re-size M6 | you | ⬜ ~$10 |
+| M5 | **Smoke runs:** `miles_rft.py --task math --smoke-test`, then `--smoke-test` (HealthBench + judge). Measure step time here and re-size M6. Then `miles_rft.py::sync_traces --run-id RUN_ID --final`: check the step numbers against Miles' | you | ⬜ ~$10 |
 | M6 | **The run:** Qwen3.5-4B, 16 prompts × 8 samples, ≤1,024 tokens, ~60 steps, in-loop eval every 10 | you | ⬜ ~$30–40 Modal + ~$20 API |
 | M7 | **Eval and write-up:** export, sample, score, `compare` against the base. The README's numbers are Claude's; the interpretation is yours. Prep notes go in `resume/applications/handshake/` | both | ⬜ |
 | Stretch | 35B-A3B LoRA (Megatron backend, TP2 × EP4, `--lora-base-cpu-backup`), only if M6 is done by Tue afternoon and ~$20 is left | | ⬜ |

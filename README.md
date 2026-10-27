@@ -32,7 +32,10 @@ On 1,000 physician judgments from `oss_meta_eval`, stratified by rubric category
 The metric is simple-evals': balanced F1 = (F1 on "met" + F1 on "not met") / 2,
 over every (judge, physician) label pair. Physicians are scored against each other
 the same way, on all 29.5K judgments. Run:
-`python -m rubricrl.analysis.calibrate report --n 1000`.
+`python -m rubricrl.analysis.calibrate report --n 1000`. In the W&B project
+`rl-finetune` (Weave), every judge call is its own `judge_verdict` trace: filter on
+the run, the category, `repeat` (1 = retest) or `agrees_with_majority = false` to
+read the disagreements. Each run's metrics are a summary-only evaluation.
 
 | Rater | Balanced F1 | F1 met | F1 not met | Says "met" | Test-retest agreement (κ) |
 |---|---|---|---|---|---|
@@ -83,9 +86,11 @@ between runs, not their levels (`python -m rubricrl.evals.run compare`).
 | `src/rubricrl/judge/` | `prompt.py` (simple-evals' grader prompt, verbatim); `client.py` (Claude judge: structured output, retries, SQLite verdict cache, `FakeJudge`) |
 | `src/rubricrl/rewards/` | `rubric.py` (the HealthBench score); `miles_rm.py` (the Miles reward function) |
 | `src/rubricrl/analysis/calibrate.py` | Judge vs physicians, physician ceiling, test-retest, agreement by length |
+| `src/rubricrl/observe.py` | W&B Weave: calibration evaluations, the grader prompt and data versioned, training judge records as traces (optional extra `observe`) |
 | `src/rubricrl/evals/run.py` | Scores samples under each judge: full / training / held-out, per axis, CIs, paired comparison |
 | `modal/sample.py` | SGLang sampling of the eval subset, for any base model or exported checkpoint |
-| `modal/miles_rft.py` | GRPO with Miles on Modal (adapted from Modal's `miles_grpo` example), and checkpoint export |
+| `modal/calibrate.py` | Judge calibration on a Modal CPU container, logged to Weave; the verdict cache is merged both ways with the Mac's |
+| `modal/miles_rft.py` | GRPO with Miles on Modal (adapted from Modal's `miles_grpo` example), checkpoint export, and `sync_traces` (the reward log to Weave) |
 | `modal/ray_cluster.py` | Ray on Modal (1 node, or 2 clustered nodes with RDMA) and `rubricrl.cluster_check`, a GPU / NCCL check |
 | `scripts/` | `time_model.py`, `memory_math.py` |
 | `docs/diagrams/` | `.excalidraw` sources and rendered SVGs |
@@ -93,13 +98,13 @@ between runs, not their levels (`python -m rubricrl.evals.run compare`).
 ## Setup
 
 ```bash
-uv sync --extra train --extra modal   # Python 3.14, versions pinned by uv.lock
+uv sync --extra train --extra modal --extra observe   # Python 3.14, pinned by uv.lock
 uv run pytest -q
 uv run ruff check . && uv run ruff format --check .
 ```
 
-- **API key:** `ANTHROPIC_API_KEY`, or on macOS the Keychain item
-  `anthropic-api-key`.
+- **API keys:** `ANTHROPIC_API_KEY` and `WANDB_API_KEY`, or on macOS the Keychain
+  items `anthropic-api-key` and `wandb-api-key`.
 - **Modal secrets:** `anthropic`, `wandb`, `huggingface-secret`.
 - **Verdict cache:** every verdict is cached in `~/.cache/rubricrl/judge.sqlite`,
   so a rerun costs nothing.
@@ -111,7 +116,15 @@ Local, no GPU:
 ```bash
 uv run python -m rubricrl.data.healthbench download
 uv run python -m rubricrl.data.healthbench export-miles
-uv run python -m rubricrl.analysis.calibrate run --judge haiku --n 1000
+```
+
+Judge calibration (Modal CPU, logged to Weave; results land in
+`analysis/out/calibration/`):
+
+```bash
+uv run modal run modal/calibrate.py --backfill    # the table above, all cached: $0
+uv run modal run modal/calibrate.py --judge haiku --effort medium --thinking --n 1000
+uv run python -m rubricrl.analysis.calibrate report --n 1000
 ```
 
 Baselines (Modal, then local scoring):
@@ -128,6 +141,7 @@ GRPO (Modal):
 uv run modal run modal/miles_rft.py --task math --smoke-test    # the pipeline, no judge
 uv run modal run modal/miles_rft.py --smoke-test                # 2 steps with the judge
 uv run modal run --detach modal/miles_rft.py --num-rollout 60
+uv run modal run modal/miles_rft.py::sync_traces --run-id RUN_ID    # any time; --final at the end
 uv run modal run modal/miles_rft.py::export --run-id RUN_ID
 uv run modal run modal/sample.py --model qwen3.5-4b --checkpoint RUN_ID/huggingface/iter_0000060 --name rft-60
 uv run python -m rubricrl.evals.run score runs/samples/rft-60.jsonl

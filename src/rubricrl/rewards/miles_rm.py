@@ -23,6 +23,9 @@ Configured by environment variables (set in `modal/miles_rft.py`):
     RUBRICRL_CACHE        SQLite verdict cache          (default ~/.cache/rubricrl)
     RUBRICRL_LOG          JSONL, one line per sample    (default: no log)
 
+Each log line has every criterion's verdict and explanation; `sync_traces` in
+`modal/miles_rft.py` sends the log to W&B Weave (`rubricrl.observe`).
+
 Shipped into the Miles image (Python 3.12): keep the syntax 3.10-compatible.
 """
 
@@ -96,7 +99,16 @@ async def grade_sample(judge, metadata: dict, response: str) -> dict:
         "score": s,
         "reward": 0.0 if s is None else s,
         "axes": axis_scores(criteria, met),
-        "met": {c.id: m for c, m in zip(criteria, met, strict=True)},
+        "criteria": [
+            {
+                "id": c.id,
+                "text": c.text,
+                "points": c.points,
+                "met": v.met,
+                "explanation": v.explanation,
+            }
+            for c, v in zip(criteria, verdicts, strict=True)
+        ],
         "failed": sum(m is None for m in met),
         "chars": len(answer),
         "response": answer,

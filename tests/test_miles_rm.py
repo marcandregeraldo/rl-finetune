@@ -42,6 +42,8 @@ def test_grades_the_right_half(is_eval):
     positives = sum(c["points"] for c in half if c["points"] > 0)
     assert rec["score"] == pytest.approx((positives - 5) / positives)
     assert rec["eval"] is is_eval and rec["response"] == "answer"
+    assert [c["id"] for c in rec["criteria"]] == [c["id"] for c in half]
+    assert all(c["met"] is True and "explanation" in c for c in rec["criteria"])
 
 
 def test_reward_entry_point(tmp_path, monkeypatch):

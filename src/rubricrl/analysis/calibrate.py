@@ -17,6 +17,8 @@ this is the judge's own noise) and agreement by completion length.
     python -m rubricrl.analysis.calibrate run --judge sonnet --n 2000
     python -m rubricrl.analysis.calibrate report      # Markdown for the README
 
+On Modal, logged to W&B Weave: `modal run modal/calibrate.py` (`--weave` here).
+
 The meta-eval rubrics are cluster-level ("consensus") criteria: 34 categories,
 30 distinct texts, each one in its conversation's oss_eval rubric. The training
 reward is mostly example-level criteria (49,184 of 57,237). The number calibrates
@@ -41,6 +43,7 @@ from rubricrl.judge.client import (
     JudgeConfig,
     Verdict,
     VerdictCache,
+    cache_key,
 )
 from rubricrl.judge.prompt import render
 
@@ -167,8 +170,12 @@ def sample_judgments(
 
 
 async def grade_all(
-    judge, judgments: Sequence[Judgment], repeat: int = 0
+    judge, judgments: Sequence[Judgment], repeat: int = 0, grade=None
 ) -> list[Verdict]:
+    """Every judgment through `judge`, or through `grade(judgments, repeat)` when
+    given (`observe.traced_grader`: a Weave trace per completion)."""
+    if grade is not None:
+        return await grade(judgments, repeat)
     done, t0 = 0, time.monotonic()
 
     async def one(j: Judgment) -> Verdict:
@@ -193,6 +200,18 @@ def estimate(judgments: Sequence[Judgment]) -> dict[str, float]:
     }
 
 
+def cache_coverage(
+    config: JudgeConfig, subset: Sequence[Judgment], retest: int, cache: VerdictCache
+) -> tuple[int, int]:
+    """(verdicts already cached, verdicts the run needs)."""
+    keys = [
+        cache_key(config, render(j.messages, j.completion, j.rubric), repeat)
+        for repeat, items in ((0, subset), (1, subset[:retest]))
+        for j in items
+    ]
+    return sum(cache.get(k) is not None for k in keys), len(keys)
+
+
 def label(config: JudgeConfig) -> str:
     return f"{config.model}-{config.effort}" + ("-thinking" if config.thinking else "")
 
@@ -208,25 +227,47 @@ async def run(
     cache: str | None = None,
     root: Path = healthbench.RAW,
     out: Path = OUT,
+    weave_project: str | None = None,
+    require_cached: bool = False,
 ) -> dict:
+    """Grade `n` judgments (and the first `retest` again); write the result JSON.
+
+    `weave_project`: also log the run to W&B Weave (`rubricrl.observe`).
+    `require_cached`: stop before any API call unless every verdict is cached.
+    """
     all_judgments = healthbench.load_judgments(root)
     subset = sample_judgments(all_judgments, n, seed)
     config = JudgeConfig.named(
         judge_name, effort=effort, thinking=thinking, concurrency=concurrency
     )
-    judge = ClaudeJudge(config, VerdictCache(cache) if cache else VerdictCache())
+    verdict_cache = VerdictCache(cache) if cache else VerdictCache()
+    hits, needed = cache_coverage(config, subset, retest, verdict_cache)
+    print(f"{label(config)}: {hits}/{needed} verdicts cached")
+    if require_cached and hits < needed:
+        raise SystemExit(f"{needed - hits} verdicts not cached (--require-cached)")
+    judge = ClaudeJudge(config, verdict_cache)
+    grade = None
+    if weave_project:  # a trace per completion, its judge calls as children
+        from rubricrl import observe
+
+        observe.init(weave_project)
+        dataset = observe.publish_judgments(subset, seed)
+        attributes = observe.run_attributes(
+            label(config), config, len(subset), seed, observe.publish_prompt()
+        )
+        grade = observe.traced_grader(judge, attributes)
     print(
         f"{config.model}: grading {len(subset)} judgments (estimate {estimate(subset)})"
     )
-    verdicts = await grade_all(judge, subset)
+    verdicts = await grade_all(judge, subset, grade=grade)
     labels = [v.met for v in verdicts]
     retest_items = subset[:retest]
     print(f"{config.model}: regrading {len(retest_items)} for test-retest")
-    retest = [v.met for v in await grade_all(judge, retest_items, repeat=1)]
+    retest_verdicts = await grade_all(judge, retest_items, repeat=1, grade=grade)
     both = [
-        (a, b)
-        for a, b in zip(labels, retest, strict=False)
-        if a is not None and b is not None
+        (a, b.met)
+        for a, b in zip(labels, retest_verdicts, strict=False)
+        if a is not None and b.met is not None
     ]
     result = {
         "model": config.model,
@@ -255,6 +296,11 @@ async def run(
         | {"cost_usd": round(judge.usage.cost(config.model), 3)},
         "labels": {j.id: x for j, x in zip(subset, labels, strict=True)},
     }
+    if weave_project:
+        result["weave_url"] = observe.log_calibration_summary(
+            result, attributes, dataset
+        )
+        print(f"weave: {result['weave_url']}")
     out.mkdir(parents=True, exist_ok=True)
     path = out / f"{label(config)}-n{len(subset)}.json"
     path.write_text(json.dumps(result, indent=1))
@@ -355,6 +401,12 @@ def estimate_cmd(n: int, seed: int, root: Path) -> None:
 @click.option("--concurrency", default=32, show_default=True)
 @click.option("--retest", default=200, show_default=True, help="items graded twice")
 @click.option("--cache", default=None, help="SQLite path (default ~/.cache/rubricrl)")
+@click.option(
+    "--weave", "weave_project", default=None, help="also log to this W&B Weave project"
+)
+@click.option(
+    "--require-cached", is_flag=True, help="stop unless every verdict is cached"
+)
 def run_cmd(**kwargs) -> None:
     asyncio.run(run(**kwargs))
 

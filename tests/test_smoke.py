@@ -17,6 +17,7 @@ MODULES = [
     "rubricrl.evals.run",
     "rubricrl.judge.client",
     "rubricrl.judge.prompt",
+    "rubricrl.observe",
     "rubricrl.rewards.miles_rm",
     "rubricrl.rewards.rubric",
 ]
@@ -60,6 +61,27 @@ def test_modal_apps_load():
     # The two apps share a Volume layout: same names, same pinned revisions.
     for name, (repo, rev) in rft.MODELS.items():
         assert sample.MODELS[name][:2] == (repo, rev)
+
+
+def test_calibrate_app_loads():
+    pytest.importorskip("modal")
+    app = _load(ROOT / "modal" / "calibrate.py")
+    assert app.app.name == "rubricrl-calibrate" and len(app.BACKFILL) == 4
+    rft = _load(ROOT / "modal" / "miles_rft.py")
+    assert rft.sync_traces is not None and rft.COMMIT_EVERY_S > 0
+
+
+def test_without_weave_installed():
+    """The base install and the Miles image don't have weave: nothing else needs it."""
+    import subprocess
+    import sys
+
+    code = (
+        "import sys; sys.modules['weave'] = None\n"
+        "import rubricrl.rewards.miles_rm, rubricrl.judge.client\n"
+        "import rubricrl.analysis.calibrate, rubricrl.evals.run, rubricrl.observe\n"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)
 
 
 def test_miles_args_are_well_formed(tmp_path):

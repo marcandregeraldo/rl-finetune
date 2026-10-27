@@ -25,17 +25,26 @@ Once: Modal secrets `anthropic` (ANTHROPIC_API_KEY), `wandb` (WANDB_API_KEY),
     modal run modal/miles_rft.py --smoke-test                  # 2 steps, real judge
     modal run --detach modal/miles_rft.py --num-rollout 60     # the run
     modal run modal/miles_rft.py::export --run-id RUN_ID       # -> HF weights
+    modal run modal/miles_rft.py::sync_traces --run-id RUN_ID  # judge log -> Weave
 
 Outputs go to the `rubricrl-runs` Volume under RUN_ID: checkpoints, TensorBoard
 events, `rewards.jsonl` (one line per graded sample: score, verdicts, response)
-and the judge's SQLite cache.
+and the judge's SQLite cache. `sync_traces` sends `rewards.jsonl` to W&B Weave
+(`rubricrl.observe`): a trace per graded sample (the conversation, the score, a
+child per judge verdict), every eval record and a sample of the training ones,
+plus a summary evaluation per eval round. It resumes where the last sync
+stopped, so run it during the run (the Volume is committed every few minutes) and
+once after with `--final`. Weave isn't installed in the Miles image: syncing runs
+in its own.
 """
 
+import json
 import os
 import shlex
 import shutil
 import socket
 import subprocess
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -135,6 +144,24 @@ image = (
     .add_local_python_source("rubricrl")
     .add_local_dir(ROOT / "data" / "miles", str(HB))
 )
+
+
+# For sync_traces: uv.lock's environment with Weave, as on the Mac (the parity
+# rule), not the Miles image. The Python series of .python-version, read locally.
+PYTHON_SERIES = (
+    ".".join((ROOT / ".python-version").read_text().strip().split(".")[:2])
+    if modal.is_local()
+    else None
+)
+observe_image = (
+    modal.Image.debian_slim(python_version=PYTHON_SERIES)
+    .uv_sync(
+        str(ROOT), extras=["observe"], extra_options="--no-dev", uv_version="0.13.5"
+    )
+    .add_local_python_source("rubricrl")
+    .add_local_dir(ROOT / "data" / "miles", str(HB))  # the conversations, by prompt id
+)
+COMMIT_EVERY_S = 300  # so sync_traces can read rewards.jsonl during the run
 
 
 def training_args(
@@ -251,6 +278,16 @@ def train(
         env=env,
         check=True,
     )  # fmt: skip
+    stop = threading.Event()
+
+    def commit_periodically() -> None:
+        while not stop.wait(COMMIT_EVERY_S):
+            try:
+                runs_volume.commit()
+            except Exception as e:  # never fail the run over a sync point
+                print(f"periodic Volume commit failed: {e}", flush=True)
+
+    threading.Thread(target=commit_periodically, daemon=True).start()
     try:
         ray.init(address=f"{ip}:6379")
         print(f"Ray cluster ready: {ray.cluster_resources()}", flush=True)
@@ -261,6 +298,7 @@ def train(
         )
         print(f"training took {(time.monotonic() - t0) / 60:.1f} min", flush=True)
     finally:
+        stop.set()
         if cache.exists():
             shutil.copy(cache, run_dir / "judge.sqlite")
         runs_volume.commit()
@@ -330,3 +368,51 @@ def export(run_id: str, iteration: int = 0, model: str = "qwen3.5-4b") -> str:
     runs_volume.commit()
     print(f"Hugging Face model saved to {output}")
     return str(output.relative_to(RUNS))
+
+
+@app.function(
+    image=observe_image,
+    volumes={RUNS: runs_volume},
+    secrets=[modal.Secret.from_name("wandb")],
+    timeout=30 * MINUTES,
+)
+def sync_traces(run_id: str, rate: float = 0.1, final: bool = False) -> dict:
+    """New lines of RUN_ID/rewards.jsonl -> Weave; the position is kept in the run dir.
+
+    --rate   share of training records traced (eval records: all of them)
+    --final  also send a trailing eval round (only once the run is over)
+    """
+    from rubricrl import observe
+
+    runs_volume.reload()
+    run_dir = RUNS / run_id
+    state_path = run_dir / "weave_sync.json"
+    state = {"offset": 0, "train_seen": 0, "urls": []}
+    if state_path.exists():
+        state = json.loads(state_path.read_text())
+    args = shlex.split((run_dir / "args.txt").read_text())
+    batch = int(args[args.index("--global-batch-size") + 1])  # samples per step
+    with (run_dir / "rewards.jsonl").open("rb") as f:
+        f.seek(state["offset"])
+        lines = f.read().split(b"\n")[:-1]  # complete lines only
+    records = [json.loads(line) for line in lines]
+    rounds, traces, consumed, train_seen = observe.split_records(
+        records, state["train_seen"], batch, rate, run_id, final
+    )
+    conversations = {}
+    for path in HB.glob("*.jsonl"):
+        for line in path.read_text().splitlines():
+            metadata = json.loads(line)["metadata"]
+            conversations[metadata["prompt_id"]] = metadata["messages"]
+    observe.init()
+    logged = observe.log_training(run_id, rounds, traces, conversations)
+    state = {
+        "offset": state["offset"] + sum(len(line) + 1 for line in lines[:consumed]),
+        "train_seen": train_seen,
+        "urls": state["urls"] + logged["urls"],
+    }
+    state_path.write_text(json.dumps(state, indent=1))
+    runs_volume.commit()
+    summary = {"records": consumed, "sampled_train_records": len(traces)} | logged
+    print(summary)
+    return summary

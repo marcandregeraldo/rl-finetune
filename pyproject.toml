@@ -34,6 +34,11 @@ train = [
 modal = [
     "modal>=1.1",  # Image.uv_sync
 ]
+# W&B Weave: calibration evaluations and training traces (src/rubricrl/observe.py).
+# Never imported by the Miles image or the base install.
+observe = [
+    "weave>=0.54",
+]
 
 [dependency-groups]
 dev = [
