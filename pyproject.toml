@@ -38,6 +38,16 @@ modal = [
 # Never imported by the Miles image or the base install.
 observe = [
     "weave>=0.54",
+    "wandb>=0.22",
+]
+# The OpenEnv consultation environment (src/rubricrl/env/): its server runs in its
+# own venv, also inside the Miles image (modal/miles_rft.py).
+env = [
+    "openenv>=0.10",
+]
+# Judge prompt optimization (src/rubricrl/judge/optimize.py): GEPA, no dependencies.
+optimize = [
+    "gepa>=0.1.4",
 ]
 
 [dependency-groups]
@@ -65,6 +75,8 @@ select = ["E", "W", "F", "I", "B", "UP"]
 [tool.ruff.lint.per-file-ignores]
 "scripts/memory_math.py" = ["E501"]  # wide table rows, kept readable
 "src/rubricrl/judge/prompt.py" = ["E501"]  # simple-evals' template, verbatim
+"src/rubricrl/sim/{patient,scenarios}.py" = ["E501"]  # prompt templates, verbatim prose
+"src/rubricrl/judge/optimize.py" = ["E501"]  # the reflection prompt, verbatim prose
 
 [tool.ruff.lint.isort]
 # modal/ (the Modal apps) would otherwise make the `modal` SDK look first-party.

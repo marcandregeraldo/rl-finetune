@@ -32,7 +32,8 @@ harness kept apart from the trainer.
 | M5 | **Smoke runs:** `miles_rft.py --task math --smoke-test`, then `--smoke-test` (HealthBench + judge). Measure step time here and re-size M6. Then `miles_rft.py::sync_traces --run-id RUN_ID --final`: check the step numbers against Miles' | you | ⬜ ~$10 |
 | M6 | **The run:** Qwen3.5-4B, 16 prompts × 8 samples, ≤1,024 tokens, ~60 steps, in-loop eval every 10 | you | ⬜ ~$30–40 Modal + ~$20 API |
 | M7 | **Eval and write-up:** export, sample, score, `compare` against the base. The README's numbers are Claude's; the interpretation is yours. Prep notes go in `resume/applications/handshake/` | both | ⬜ |
-| Stretch | 35B-A3B LoRA (Megatron backend, TP2 × EP4, `--lora-base-cpu-backup`), only if M6 is done by Tue afternoon and ~$20 is left | | ⬜ |
+| M8 | **RL environment (OpenEnv):** v1 single reply (parity with the in-process reward checked); v2 simulated patient: 100 test scenarios mapped from physician rubrics (polarity-checked), rewrite fidelity 86%, careful vs minimal doctor +0.45 vs −0.25, trajectory grader calibrated (0.555). Miles via `--reward env` (agentic rollout, sidecar). See `docs/report.md` §5 | Claude; GPU smoke: you | ✅ code + checks; ⬜ `--reward env` smoke, train-split scenarios (~$14) |
+| Stretch | 35B-A3B LoRA (Megatron backend, TP2 × EP4, `--lora-base-cpu-backup`), only if M6 is done by Tue afternoon and ~$20 is left. Plan, checked against Miles' source: [`docs/megatron-lora/`](docs/megatron-lora/README.md) | | ⬜ |
 
 **Cut order if time runs short:** the stretch, then the 0.8B baseline, then the
 per-axis plots, then the run's length. **Never cut calibration + baselines:**

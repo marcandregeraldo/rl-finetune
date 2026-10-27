@@ -62,7 +62,8 @@ def init(project: str = PROJECT):
     import weave
 
     _ensure_wandb_key()
-    return weave.init(project, settings={"implicitly_patch_integrations": False})
+    settings = {"implicitly_patch_integrations": False, "print_call_link": False}
+    return weave.init(project, settings=settings)
 
 
 def _url(ev) -> str | None:
@@ -95,15 +96,16 @@ def _without_conversation(inputs: dict) -> dict:
 # --- Calibration ---------------------------------------------------------------
 
 
-def publish_prompt():
-    """The grader template, versioned by its text and tagged with PROMPT_VERSION.
+def publish_prompt(template: str = GRADER_TEMPLATE, version: str = PROMPT_VERSION):
+    """The grader template, versioned by its text and tagged with its version
+    (an optimized template: `judge/optimize.py`).
 
     It holds literal JSON braces: never `.format()` the published prompt.
     """
     import weave
 
-    prompt = weave.StringPrompt(GRADER_TEMPLATE)
-    return weave.publish(prompt, name=PROMPT_NAME, tags=[PROMPT_VERSION])
+    prompt = weave.StringPrompt(template)
+    return weave.publish(prompt, name=PROMPT_NAME, tags=[version])
 
 
 def judgment_row(j: Judgment) -> dict:
@@ -245,7 +247,14 @@ def traced_grader(
     return grade
 
 
-def run_attributes(label: str, config, n: int, seed: int, prompt_ref) -> dict:
+def run_attributes(
+    label: str,
+    config,
+    n: int,
+    seed: int,
+    prompt_ref,
+    prompt_version: str = PROMPT_VERSION,
+) -> dict:
     """What identifies a calibration run, on its traces and its summary."""
     return {
         "run": label,
@@ -254,7 +263,7 @@ def run_attributes(label: str, config, n: int, seed: int, prompt_ref) -> dict:
         "thinking": config.thinking,
         "n": n,
         "seed": seed,
-        "prompt_version": PROMPT_VERSION,
+        "prompt_version": prompt_version,
         "grader_prompt": str(prompt_ref.uri()) if prompt_ref is not None else None,
     }
 
@@ -298,7 +307,7 @@ def log_calibration_summary(result: dict, attributes: dict, dataset) -> str | No
 # --- Training records ----------------------------------------------------------
 
 
-def sampled(run_id: str, index: int, rate: float) -> bool:
+def sampled(run_id: str, index: int | str, rate: float) -> bool:
     digest = hashlib.sha256(f"{run_id}:{index}".encode()).digest()
     return int.from_bytes(digest[:8], "big") / 2**64 < rate
 
@@ -432,3 +441,254 @@ def log_training(
         "eval_rounds": len(rounds),
         "urls": urls,
     }
+
+
+# --- The consultation environment ------------------------------------------------
+
+
+def episode_tracer(project: str, rate: float | None = None):
+    """A callback for `env.server`: one trace per finished episode.
+
+    Root `consultation`: the whole transcript as a chat, the result, the hidden
+    facts drawn out; a `judge_verdict` child per criterion. Eval episodes are all
+    traced; training ones at `rate` (`RUBRICRL_TRACE_RATE`, default 0.1).
+    """
+    import weave
+
+    from rubricrl.sim.patient import PATIENT_VERSION
+
+    init(project)
+    rate = float(os.environ.get("RUBRICRL_TRACE_RATE", "0.1")) if rate is None else rate
+    run = os.environ.get("RUBRICRL_TRACE_RUN", "")
+
+    def trace(scenario, obs) -> None:
+        key = f"{obs.scenario_id}:{obs.messages[-1]['content'][:200]}"
+        if obs.half != "eval" and not sampled(run or "env", key, rate):
+            return
+        root = weave.log_call(
+            op="consultation",
+            inputs={"messages": obs.messages, "scenario": scenario.id},
+            output={
+                "reward": obs.reward,
+                "score": obs.score,
+                "reveals": obs.reveals,
+                "axes": obs.axes,
+                "failed": obs.failed,
+                "turns": obs.turn,
+                "end_reason": obs.end_reason,
+                "revealed_facts": obs.revealed_facts,
+                "hidden_facts": [f.text for f in scenario.hidden_facts],
+            },
+            attributes={
+                "run": run,
+                "mode": obs.mode,
+                "half": obs.half,
+                "scenario": scenario.id,
+                "theme": scenario.theme,
+                "split": scenario.split,
+                "scenario_version": scenario.version,
+                "patient_version": PATIENT_VERSION if obs.mode == "patient" else None,
+            },
+            display_name=f"{obs.mode} · {obs.half} · {scenario.id}",
+            use_stack=False,
+        )
+        for c in obs.criteria:
+            weave.log_call(
+                op=OP,
+                inputs={"rubric_item": f"[{c.get('points')}] {c.get('text')}"},
+                output={"met": c.get("met"), "explanation": c.get("explanation")},
+                attributes={"item": c.get("id"), "source": c.get("source")},
+                parent=root,
+                display_name=str(c.get("id")),
+                use_stack=False,
+            )
+
+    return trace
+
+
+# --- W&B runs: the experiments, repeatable -------------------------------------------
+
+
+def _git() -> dict:
+    """The commit a run came from (passed in by Modal entrypoints, where there's
+    no git checkout: RUBRICRL_GIT_SHA / RUBRICRL_GIT_DIRTY)."""
+    sha = os.environ.get("RUBRICRL_GIT_SHA")
+    if sha is None and shutil.which("git"):
+        r = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True)
+        sha = r.stdout.strip() or None
+        d = subprocess.run(
+            ["git", "status", "--porcelain"], capture_output=True, text=True
+        )
+        dirty = bool(d.stdout.strip())
+    else:
+        dirty = os.environ.get("RUBRICRL_GIT_DIRTY") == "1"
+    return {"git_sha": sha, "git_dirty": dirty}
+
+
+def log_wandb_calibration(project: str, result: dict, config: dict) -> str | None:
+    """One W&B run per calibration (`job_type="calibration"`): its config, the
+    metrics in the summary, per-category and per-length tables, the confusion
+    matrix against the physician majority, and the result JSON as an artifact."""
+    import json
+    import tempfile
+
+    import wandb
+
+    _ensure_wandb_key()
+    run = wandb.init(
+        project=project,
+        job_type="calibration",
+        group=config.get("prompt_version", PROMPT_VERSION),
+        name=f"{result['label']}-n{result['n']}",
+        config=config | _git(),
+        reinit="finish_previous",
+    )
+    run.summary.update(
+        calibration_summary(result) | {"weave_url": result.get("weave_url")}
+    )
+    phys = result["physicians_all"]
+    rows = [
+        [
+            c.removeprefix("cluster:"),
+            m.get("f1_balanced"),
+            phys.get(c, {}).get("f1_balanced_mean"),
+            m.get("n_pairs"),
+        ]
+        for c, m in sorted(result["judge"].items())
+        if c != "overall"
+    ]
+    by_cat = wandb.Table(
+        columns=["category", "judge_f1_balanced", "physicians_f1_balanced", "pairs"],
+        data=rows,
+    )
+    by_len = wandb.Table(
+        columns=["bucket", "chars_min", "chars_max", "n", "f1_balanced"],
+        data=[
+            [b["bucket"], b["chars_min"], b["chars_max"], b["n"], b["f1_balanced"]]
+            for b in result["by_length"]
+        ],
+    )
+    run.log(
+        {
+            "by_category": by_cat,
+            "by_length": by_len,
+            "f1_by_category": wandb.plot.bar(
+                by_cat, "category", "judge_f1_balanced", title="Balanced F1 by category"
+            ),
+            "f1_by_length": wandb.plot.line(
+                by_len, "bucket", "f1_balanced", title="Balanced F1 by length quartile"
+            ),
+        }
+    )
+    if (cm := result.get("confusion")) is not None:
+        run.log(
+            {
+                "confusion_vs_majority": wandb.Table(
+                    columns=list(cm), data=[list(cm.values())]
+                )
+            }
+        )
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "result.json")
+        with open(path, "w") as f:
+            json.dump(result, f)
+        art = wandb.Artifact(
+            f"calibration-{result['label']}-n{result['n']}", "calibration-result"
+        )
+        art.add_file(path)
+        run.log_artifact(art)
+    url = run.url
+    run.finish()
+    return url
+
+
+def log_wandb_scenarios(project: str, split: str, summary: dict, path) -> str | None:
+    """A scenario build as a W&B run (`job_type="scenarios"`): what the mapping
+    kept, rewrote and dropped, the cost, and the scenarios as an artifact."""
+    import wandb
+
+    _ensure_wandb_key()
+    run = wandb.init(
+        project=project,
+        job_type="scenarios",
+        name=f"scenarios-{split}-{summary.get('version')}",
+        config={
+            "split": split,
+            "version": summary.get("version"),
+            "model": summary.get("model"),
+        }
+        | _git(),
+        reinit="finish_previous",
+    )
+    flat = {f"statuses/{k}": v for k, v in summary.get("statuses", {}).items()}
+    flat |= {f"share/{k}": v for k, v in summary.get("share", {}).items()}
+    run.summary.update(
+        flat
+        | {
+            k: summary[k]
+            for k in ("scenarios", "criteria", "hidden_facts_mean", "cost_usd")
+            if k in summary
+        }
+    )
+    themes = summary.get("by_theme", {})
+    statuses = sorted({s for c in themes.values() for s in c})
+    run.log(
+        {
+            "by_theme": wandb.Table(
+                columns=["theme", *statuses],
+                data=[[t, *(c.get(s, 0) for s in statuses)] for t, c in themes.items()],
+            )
+        }
+    )
+    art = wandb.Artifact(f"scenarios-{split}", "scenarios")
+    art.add_file(str(path))
+    run.log_artifact(art)
+    url = run.url
+    run.finish()
+    return url
+
+
+def log_wandb_check(project: str, check: str, out: dict) -> str | None:
+    """A simulation check as a W&B run (`job_type="env-check"`): the scalar
+    results in the summary, the per-item rows (disagreements, episodes) as tables."""
+    import json
+
+    import wandb
+
+    _ensure_wandb_key()
+    run = wandb.init(
+        project=project, job_type="env-check", name=check, config=_git(),
+        reinit="finish_previous",
+    )  # fmt: skip
+
+    def scalars(d: dict, prefix: str = "") -> dict:
+        flat = {}
+        for k, v in d.items():
+            if isinstance(v, dict):
+                flat |= scalars(v, f"{prefix}{k}/")
+            elif isinstance(v, (int, float, str)) or v is None:
+                flat[f"{prefix}{k}"] = v
+        return flat
+
+    run.summary.update(scalars(out))
+    for key, rows in _row_lists(out):
+        cols = sorted({c for r in rows for c in r})
+        data = [
+            [
+                json.dumps(r.get(c)) if isinstance(r.get(c), (list, dict)) else r.get(c)
+                for c in cols
+            ]
+            for r in rows
+        ]
+        run.log({key: wandb.Table(columns=cols, data=data)})
+    url = run.url
+    run.finish()
+    return url
+
+
+def _row_lists(d: dict, prefix: str = ""):
+    for k, v in d.items():
+        if isinstance(v, list) and v and all(isinstance(r, dict) for r in v):
+            yield f"{prefix}{k}", v
+        elif isinstance(v, dict):
+            yield from _row_lists(v, f"{prefix}{k}/")

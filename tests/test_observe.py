@@ -130,7 +130,7 @@ def test_init_and_publish(weave):
     assert weave.published[0] == (
         "init",
         "proj",
-        {"implicitly_patch_integrations": False},
+        {"implicitly_patch_integrations": False, "print_call_link": False},
     )
     ref = observe.publish_prompt()
     (prompt, name, tags) = weave.published[1]
@@ -203,7 +203,8 @@ def _result() -> dict:
         "judge": {"overall": o}, "retest": {"agreement": 0.9, "kappa": 0.7},
         "judge_rate_met": 0.4, "physician_rate_met": 0.8, "failed": 0,
         "physicians_all": {"overall": {"f1_balanced_mean": 0.67}},
-        "by_length": [{"chars_min": 1, "chars_max": 9, "f1_balanced": 0.6}],
+        "by_length": [{"bucket": 0, "chars_min": 1, "chars_max": 9, "n": 3,
+                       "f1_balanced": 0.6}],
         "usage": {"cost_usd": 0.0},
     }  # fmt: skip
 
@@ -286,3 +287,112 @@ def test_wandb_key_from_keychain_never_printed(monkeypatch, capsys):
     observe._ensure_wandb_key()
     assert observe.os.environ["WANDB_API_KEY"] == "secret-key"
     assert "secret-key" not in capsys.readouterr().out
+
+
+class FakeRun:
+    def __init__(self, **kw):
+        self.kw, self.summary, self.logged, self.artifacts = kw, {}, [], []
+        self.url = "https://wandb.ai/run/1"
+
+    def log(self, d):
+        self.logged.append(d)
+
+    def log_artifact(self, a):
+        self.artifacts.append(a)
+
+    def finish(self):
+        self.finished = True
+
+
+@pytest.fixture
+def wandb(monkeypatch):
+    runs = []
+
+    class Table:
+        def __init__(self, columns, data):
+            self.columns, self.data = columns, data
+
+    class Artifact:
+        def __init__(self, name, type):
+            self.name, self.type, self.files = name, type, []
+
+        def add_file(self, path):
+            self.files.append(path)
+
+    module = types.ModuleType("wandb")
+    module.init = lambda **kw: runs.append(FakeRun(**kw)) or runs[-1]
+    module.Table, module.Artifact = Table, Artifact
+    module.plot = types.SimpleNamespace(
+        bar=lambda t, x, y, title: ("bar", x, y),
+        line=lambda t, x, y, title: ("line", x, y),
+    )
+    monkeypatch.setitem(sys.modules, "wandb", module)
+    monkeypatch.setenv("WANDB_API_KEY", "k")
+    return runs
+
+
+def test_wandb_calibration_run(wandb):
+    result = _result() | {
+        "label": "claude-haiku-5-5-low", "n": 3,
+        "judge": {"overall": _result()["judge"]["overall"],
+                  "cluster:a": {"f1_balanced": 0.5, "n_pairs": 9}},
+        "physicians_all": {"overall": {"f1_balanced_mean": 0.67},
+                           "cluster:a": {"f1_balanced_mean": 0.7}},
+        "confusion": {"tp": 1, "fp": 0, "fn": 1, "tn": 1},
+    }  # fmt: skip
+    url = observe.log_wandb_calibration("proj", result, {"judge": "haiku", "n": 3})
+    (run,) = wandb
+    assert url == run.url and run.kw["job_type"] == "calibration"
+    assert run.kw["name"] == "claude-haiku-5-5-low-n3" and run.kw["config"]["n"] == 3
+    assert "git_sha" in run.kw["config"]
+    assert run.summary["f1_balanced"] == 0.6 and run.summary["retest_kappa"] == 0.7
+    tables = {k: v for d in run.logged for k, v in d.items()}
+    assert tables["by_category"].data == [["a", 0.5, 0.7, 9]]
+    assert tables["confusion_vs_majority"].data == [[1, 0, 1, 1]]
+    assert run.artifacts[0].type == "calibration-result"
+
+
+def test_wandb_scenarios_run(wandb, tmp_path):
+    path = tmp_path / "test.jsonl"
+    path.write_text("{}\n")
+    summary = {
+        "version": "scenario-v1", "model": "m", "scenarios": 2, "criteria": 10,
+        "statuses": {"kept": 4, "rewritten": 5, "dropped": 1},
+        "share": {"kept": 0.4}, "hidden_facts_mean": 2.5, "cost_usd": 0.05,
+        "by_theme": {"hedging": {"kept": 4, "dropped": 1}},
+    }  # fmt: skip
+    observe.log_wandb_scenarios("proj", "test", summary, path)
+    (run,) = wandb
+    assert run.kw["job_type"] == "scenarios" and run.summary["statuses/rewritten"] == 5
+    assert run.summary["scenarios"] == 2 and run.artifacts[0].files == [str(path)]
+    (table,) = run.logged[0].values()
+    assert table.columns == ["theme", "dropped", "kept"]
+
+
+def test_episode_tracer_one_trace_per_episode(weave, monkeypatch):
+    from rubricrl.env.models import ConsultObservation
+    from rubricrl.sim.scenario import Fact, Scenario
+
+    pytest.importorskip("openenv")
+    scenario = Scenario("p1", "patient", [], [], [], theme="hedging",
+                        hidden_facts=(Fact("f1", "takes warfarin"),))  # fmt: skip
+    obs = ConsultObservation(
+        scenario_id="p1", mode="patient", half="eval", done=True, reward=0.5,
+        messages=[{"role": "user", "content": "hi"},
+                  {"role": "assistant", "content": "x"}],
+        score=0.5, criteria=[{"id": "p1:0~t", "source": "p1:0", "text": "Asks",
+                              "points": 5, "met": True, "explanation": "e"}],
+        turn=1, end_reason="patient_ended", revealed_facts=["f1"],
+    )  # fmt: skip
+    trace = observe.episode_tracer("proj", rate=0.0)
+    trace(scenario, obs)  # eval episodes: always traced
+    root, child = weave.calls
+    assert root.op == "consultation" and root.parent is None
+    assert root.inputs["messages"] == obs.messages
+    assert root.output["revealed_facts"] == ["f1"]
+    assert root.output["hidden_facts"] == ["takes warfarin"]
+    assert root.attributes["half"] == "eval" and child.parent == root.id
+    assert child.inputs["rubric_item"] == "[5] Asks"
+    weave.calls.clear()
+    trace(scenario, obs.model_copy(update={"half": "train"}))  # rate 0: skipped
+    assert weave.calls == []
