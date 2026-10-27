@@ -12,7 +12,8 @@ H100s** instead of two clustered 8-GPU nodes. What changes:
   The in-loop eval (`eval/healthbench_val`) is scored on the *held-out* criteria.
 - **Data:** `data/miles/*.jsonl` (`python -m rubricrl.data.healthbench export-miles`),
   attached to the container (not baked into the image).
-- **Responses capped at 1,024 tokens**, prompts at 2,048.
+- **Responses capped at 8,192 tokens** (2,048 per turn in patient mode), prompts
+  at 2,048.
 
 Miles runs in its own image, so this is the exception to the "Modal installs from
 uv.lock" rule: the image is Miles', and `rubricrl` is added as source (its Miles
@@ -26,6 +27,27 @@ Once: Modal secrets `anthropic` (ANTHROPIC_API_KEY), `wandb` (WANDB_API_KEY),
     modal run --detach modal/miles_rft.py --num-rollout 60     # the run
     modal run modal/miles_rft.py::export --run-id RUN_ID       # -> HF weights
     modal run modal/miles_rft.py::sync_traces --run-id RUN_ID  # judge log -> Weave
+    modal run modal/miles_rft.py --smoke-test --reward env     # vs the OpenEnv env
+    modal run modal/miles_rft.py --smoke-test --reward env --env-mode patient
+    modal run --detach modal/miles_rft.py --reward env --no-dashboard
+    modal run modal/miles_rft.py::ray_check --hold-s 600         # try the login (CPU)
+    modal run modal/miles_rft.py::log_check                      # W&B keys (CPU)
+
+**Watching a run.** W&B (project rl-finetune, one run named RUN_ID, tagged with
+the reward path and judge): Miles' `train/*` (loss, pg_loss, grad_norm, lr-pg_0,
+KL, clip fractions, TIS), `rollout/*` (reward, response lengths, truncation,
+zero-variance groups), `eval/<dataset>` (the held-out criteria score), `perf/*`
+(timings), plus the rubric's `rollout/rubric/*` and `eval/<dataset>/rubric/*`
+(per-axis scores, penalty criteria met, failed verdicts, judge cost, policy vs
+environment time) and `*/run/*` (groups with no signal, perfect and nonpositive
+shares, per-theme scores, tokens, running GPU + judge cost; after the panels of
+Xiaomi's MiMo-V2.6 RL dashboard): `rubricrl.rewards.miles_log`.
+Every run serves the Ray dashboard (actors, logs, GPU use) through a Modal
+tunnel, behind a fresh Ray token, with its time-series charts from Prometheus and
+Grafana (view-only, its own tunnel): the URLs and the command that copies the
+token are in the Modal logs. `--no-metrics` skips Prometheus and Grafana,
+`--no-dashboard` all of it (`modal container exec CONTAINER_ID ray status` still
+reaches the cluster). `log_check` (CPU) prints every key a step logs.
 
 Outputs go to the `rubricrl-runs` Volume under RUN_ID: checkpoints, TensorBoard
 events, `rewards.jsonl` (one line per graded sample: score, verdicts, response)
@@ -38,8 +60,10 @@ once after with `--final`. Weave isn't installed in the Miles image: syncing run
 in its own.
 """
 
+import contextlib
 import json
 import os
+import secrets
 import shlex
 import shutil
 import socket
@@ -56,13 +80,29 @@ MINUTES = 60
 TIMEOUT = 6 * 60 * MINUTES
 GPU = "H100!"  # "!": never silently upgraded, so timings say which hardware
 N_GPUS = 4
+GPU_USD_PER_HOUR = 3.95  # one H100 on Modal (list price): the W&B cost estimate
 ROOT = Path(__file__).parent.parent
 DATA = Path("/data")  # models and datasets (Volume rubricrl-data)
 RUNS = Path("/runs")  # checkpoints and logs (Volume rubricrl-runs)
 HB = Path("/rubricrl-data")  # data/miles, attached at container start
 MILES = Path("/opt/miles")
+DASHBOARD_PORT, GRAFANA_PORT, PROMETHEUS_PORT = 8265, 3000, 9090
+RAY_TOKEN = Path("/root/.ray/auth_token")  # where Ray's clients look for it
+# The Ray dashboard's time-series charts (`--dashboard`): Prometheus + Grafana,
+# pinned and baked into the image, as in the logo-segmentation project. Ray's
+# dashboard writes ready-made configs for both here when it starts.
+PROMETHEUS_VERSION, GRAFANA_VERSION = "3.15.1", "13.2.4"
+RAY_METRICS_DIR = Path("/tmp/ray/session_latest/metrics")
+ENV_SRC, ENV_VENV = "/opt/rubricrl-env-src", "/opt/rubricrl-env"  # the env server
+ENV_PORT = 8003
 MILES_REPO = "https://github.com/radixark/miles.git"
 MILES_COMMIT = "2806267d060d51b1d3b62f85a1f9b145047aeef9"  # v0.1.1
+# Miles' 120 s wait for its session server, patched in the image (see `image`).
+READY_PY, READY_VAR = (
+    MILES / "miles/ray/rollout/router_manager.py",
+    "_SERVER_READY_TIMEOUT_SECS",
+)
+READY_S = 600
 ANTHROPIC_VERSION = "2.3.0"  # the version in uv.lock
 
 # name -> (HF repo, revision). Same layout as modal/sample.py: DATA/models/<name>.
@@ -133,6 +173,38 @@ image = (
         f"cd {MILES} && git checkout {MILES_COMMIT} && pip install --no-deps -e .",
         f"pip install anthropic=={ANTHROPIC_VERSION}",
     )
+    # The consultation environment's server (--reward env) runs from its own venv,
+    # uv.lock's exact versions (the parity rule): OpenEnv's server stack (FastAPI,
+    # gradio, fastmcp) never touches Miles' Python. Miles' side only needs
+    # `websockets` (rubricrl.env.wire).
+    .add_local_file(ROOT / "pyproject.toml", f"{ENV_SRC}/pyproject.toml", copy=True)
+    .add_local_file(ROOT / "uv.lock", f"{ENV_SRC}/uv.lock", copy=True)
+    .add_local_file(ROOT / ".python-version", f"{ENV_SRC}/.python-version", copy=True)
+    .run_commands(
+        "pip install uv==0.13.5",
+        f"cd {ENV_SRC} && UV_PROJECT_ENVIRONMENT={ENV_VENV} uv sync --frozen"
+        " --no-dev --no-install-project --extra env --extra observe",
+    )
+    # Miles waits 120 s for its session server (--use-session-server). Alone it
+    # starts in ~35 s (importing transformers / Megatron, `session_check`); in the
+    # training container it starts with 4 SGLang engines and 4 trainers loading at
+    # once, and missed the 120 s in the first smoke run. A later layer, so the
+    # Miles install above stays cached; fails the build if the line moved.
+    .run_commands(
+        f"grep -q '^{READY_VAR} = 120$' {READY_PY}"
+        f" && sed -i 's/^{READY_VAR} = 120$/{READY_VAR} = {READY_S}/' {READY_PY}"
+        f" && grep -q '^{READY_VAR} = {READY_S}$' {READY_PY}"
+    )
+    .run_commands(
+        "command -v curl || (apt-get update && apt-get install -y curl)",
+        "mkdir -p /opt/prometheus /opt/grafana",
+        "curl -fsSL https://github.com/prometheus/prometheus/releases/download/"
+        f"v{PROMETHEUS_VERSION}/prometheus-{PROMETHEUS_VERSION}.linux-amd64.tar.gz"
+        " | tar xz --strip-components=1 -C /opt/prometheus",
+        "curl -fsSL https://dl.grafana.com/oss/release/"
+        f"grafana-{GRAFANA_VERSION}.linux-amd64.tar.gz"
+        " | tar xz --strip-components=1 -C /opt/grafana",
+    )
     .env(
         {
             # /root: rubricrl, for Miles' Ray actors that import the reward.
@@ -164,9 +236,38 @@ observe_image = (
 COMMIT_EVERY_S = 300  # so sync_traces can read rewards.jsonl during the run
 
 
+# The rubric's W&B metrics (per axis, penalty criteria, failed verdicts), next to
+# Miles' own; both hooks keep Miles' default logging.
+RUBRIC_LOGS = """
+    --custom-rollout-log-function-path rubricrl.rewards.miles_log.log_rollout
+    --custom-eval-rollout-log-function-path rubricrl.rewards.miles_log.log_eval
+"""
+
+# --tito-model for Miles' session server (token-in-token-out), by model family.
+TITO = {"qwen3.5-4b": "qwen35", "qwen3-4b": "qwen3"}
+
+# Token budgets (Qwen3.5-4B's context is 262K; memory is the limit). At 1,024,
+# 53-66% of training replies (temperature 1) were cut off in the smoke run, and
+# a cut-off reply is graded as incomplete: the reward would learn the cap.
+PROMPT_TOKENS = 2048  # longer prompts are filtered out
+REPLY_TOKENS = 8192  # per reply, single-turn (rm and env v1)
+PATIENT_TURN_TOKENS = 2048  # per doctor turn, patient mode (6 turns)
+MAX_TOKENS_PER_GPU = 16384  # per micro-batch; also caps a patient-mode session
+
+
 def training_args(
-    task: str, model: str, run_dir: Path, num_rollout: int, smoke_test: bool
+    task: str,
+    model: str,
+    run_dir: Path,
+    num_rollout: int,
+    smoke_test: bool,
+    reward: str = "rm",
+    env_mode: str = "single",
 ) -> list[str]:
+    """Miles' arguments. `reward`: "rm", the in-process reward function
+    (rubricrl.rewards.miles_rm), or "env", episodes against the consultation
+    environment (rubricrl.env) through Miles' agentic rollout; `env_mode`
+    "single" (v1) or "patient" (v2, simulated patient)."""
     ckpt = DATA / "models" / model
     if task == "math":  # Modal's tested recipe on our model and node: no judge
         data = f"""
@@ -177,6 +278,28 @@ def training_args(
         --n-samples-per-eval-prompt 1
         """
         prompts, n_samples = 4, 8
+    elif reward == "env":
+        prefix = "healthbench" if env_mode == "single" else "consult"
+        val = f"{HB}/{prefix}_val.jsonl" + ("@[0:8]" if smoke_test else "")
+        # --max-seq-len: the whole session (prompt + every turn) stays within
+        # one micro-batch (--max-tokens-per-gpu). Single: one 8K reply. Patient:
+        # 6 doctor turns, so 2K each (2,048 + 6 x (2,048 + a short patient turn)).
+        reply = REPLY_TOKENS if env_mode == "single" else PATIENT_TURN_TOKENS
+        max_seq = PROMPT_TOKENS + reply if env_mode == "single" else MAX_TOKENS_PER_GPU
+        data = f"""
+        --prompt-data {HB}/{prefix}_train.jsonl
+        --input-key prompt --label-key label --metadata-key metadata
+        --custom-generate-function-path
+        miles.rollout.generate_hub.agentic_tool_call.generate
+        --custom-agent-function-path rubricrl.env.miles_agent.run
+        --custom-rm-path rubricrl.env.miles_agent.reward_func
+        --use-session-server --tito-model {TITO[model]} --max-seq-len {max_seq}
+        --eval-prompt-data {prefix}_val {val}
+        --rollout-max-response-len {reply} --eval-max-response-len {reply}
+        --rollout-max-prompt-len {PROMPT_TOKENS}
+        --n-samples-per-eval-prompt {1 if smoke_test else 2}
+        """
+        prompts, n_samples = (4, 8) if smoke_test else (16, 8)
     else:
         val = f"{HB}/healthbench_val.jsonl" + ("@[0:8]" if smoke_test else "")
         data = f"""
@@ -184,18 +307,25 @@ def training_args(
         --input-key prompt --label-key label --metadata-key metadata
         --custom-rm-path rubricrl.rewards.miles_rm.healthbench_reward
         --eval-prompt-data healthbench_val {val}
-        --rollout-max-response-len 1024 --eval-max-response-len 1024
-        --rollout-max-prompt-len 2048
+        --rollout-max-response-len {REPLY_TOKENS} --eval-max-response-len {REPLY_TOKENS}
+        --rollout-max-prompt-len {PROMPT_TOKENS}
         --n-samples-per-eval-prompt {1 if smoke_test else 2}
         """
         prompts, n_samples = (4, 8) if smoke_test else (16, 8)
+    # The agentic path renders the chat template in the session server (TITO):
+    # prompts stay message lists, and the agent turns thinking off per request.
+    template = (
+        ""
+        if task != "math" and reward == "env"
+        else """--apply-chat-template
+        --apply-chat-template-kwargs '{"enable_thinking": false}'"""
+    )
     return shlex.split(
         f"""
         --train-backend fsdp
         --hf-checkpoint {ckpt} --ref-load {ckpt}
         {data}
-        --apply-chat-template
-        --apply-chat-template-kwargs '{{"enable_thinking": false}}'
+        {template}
         --rollout-shuffle --balance-data
         --num-rollout {num_rollout}
         --rollout-batch-size {prompts} --n-samples-per-prompt {n_samples}
@@ -215,13 +345,15 @@ def training_args(
         --update-weight-buffer-size 536870912
         --gradient-checkpointing --attn-implementation flash_attention_2
         --train-env-vars '{{"PYTORCH_CUDA_ALLOC_CONF":"expandable_segments:False"}}'
-        --use-dynamic-batch-size --max-tokens-per-gpu 16384
+        --use-dynamic-batch-size --max-tokens-per-gpu {MAX_TOKENS_PER_GPU}
         --actor-num-nodes 1 --actor-num-gpus-per-node {N_GPUS}
         --colocate --use-fault-tolerance
         --save {run_dir}/checkpoints --save-interval {num_rollout if smoke_test else 20}
         --no-save-optim
         --use-tensorboard --tb-project-name rubricrl --tb-experiment-name {run_dir.name}
         --use-wandb --wandb-project rl-finetune --wandb-group {run_dir.name}
+        --disable-wandb-random-suffix
+        {"" if task == "math" else RUBRIC_LOGS}
         """
     )
 
@@ -249,6 +381,12 @@ def train(
     judge: str,
     judge_effort: str,
     judge_thinking: bool,
+    reward: str = "rm",
+    env_mode: str = "single",
+    judge_prompt: str = "gepa-v1",
+    dashboard: bool = True,
+    tags: str = "",
+    metrics: bool = True,
 ) -> str:
     import ray
 
@@ -264,20 +402,24 @@ def train(
         "RUBRICRL_JUDGE": judge,
         "RUBRICRL_EFFORT": judge_effort,
         "RUBRICRL_THINKING": "1" if judge_thinking else "",
+        "RUBRICRL_PROMPT": judge_prompt,
         "RUBRICRL_CACHE": str(cache),
         "RUBRICRL_LOG": str(run_dir / "rewards.jsonl"),
+        "RUBRICRL_ENV_URL": f"http://127.0.0.1:{ENV_PORT}",
+        "RUBRICRL_ENV_MODE": env_mode,
+        "WANDB_TAGS": tags,
+        # for the running cost in W&B (rubricrl.rewards.miles_log)
+        "RUBRICRL_RUN_START": str(time.time()),
+        "RUBRICRL_GPUS": str(N_GPUS),
+        "RUBRICRL_GPU_USD_PER_HOUR": str(GPU_USD_PER_HOUR),
     }
-    args = training_args(task, model, run_dir, num_rollout, smoke_test)
+    args = training_args(
+        task, model, run_dir, num_rollout, smoke_test, reward, env_mode
+    )
     (run_dir / "args.txt").write_text(shlex.join(args) + "\n")
     data_volume.reload()
-    subprocess.run(
-        [
-            "ray", "start", "--head", "--port=6379", f"--node-ip-address={ip}",
-            f"--num-gpus={N_GPUS}", "--num-cpus=16", "--disable-usage-stats",
-        ],
-        env=env,
-        check=True,
-    )  # fmt: skip
+    sidecar = start_env_server(env, run_dir) if reward == "env" else None
+    stack = contextlib.ExitStack()  # tunnels, Prometheus, Grafana
     stop = threading.Event()
 
     def commit_periodically() -> None:
@@ -289,9 +431,14 @@ def train(
 
     threading.Thread(target=commit_periodically, daemon=True).start()
     try:
+        links = open_dashboard(stack, env, metrics) if dashboard else {}
+        start_ray(ip, env, N_GPUS, 16, dashboard)
+        start_metrics_stack(stack, links, run_dir)
         ray.init(address=f"{ip}:6379")
         print(f"Ray cluster ready: {ray.cluster_resources()}", flush=True)
         ray.shutdown()
+        if links:
+            print_dashboard(links)
         t0 = time.monotonic()
         subprocess.run(
             ["python", str(MILES / "train.py"), *args], cwd=MILES, env=env, check=True
@@ -299,10 +446,157 @@ def train(
         print(f"training took {(time.monotonic() - t0) / 60:.1f} min", flush=True)
     finally:
         stop.set()
+        stack.close()
+        if sidecar is not None:
+            sidecar.terminate()
         if cache.exists():
             shutil.copy(cache, run_dir / "judge.sqlite")
         runs_volume.commit()
     return str(run_dir)
+
+
+def open_dashboard(stack: contextlib.ExitStack, env: dict, metrics: bool) -> dict:
+    """Tunnels to the Ray dashboard and (`metrics`) Grafana, opened before `ray
+    start`: the dashboard reads from its environment where Grafana and Prometheus
+    are, and the URL the browser loads Grafana's panels from."""
+    links = {"ray": stack.enter_context(modal.forward(DASHBOARD_PORT)).url}
+    if metrics:
+        links["grafana"] = stack.enter_context(modal.forward(GRAFANA_PORT)).url
+        env |= {
+            "RAY_GRAFANA_HOST": f"http://localhost:{GRAFANA_PORT}",
+            "RAY_PROMETHEUS_HOST": f"http://localhost:{PROMETHEUS_PORT}",
+            "RAY_GRAFANA_IFRAME_HOST": links["grafana"].rstrip("/"),
+        }
+    return links
+
+
+def start_metrics_stack(
+    stack: contextlib.ExitStack, links: dict, log_dir: Path
+) -> None:
+    """Prometheus + Grafana on the configs Ray's dashboard generated, if `links`
+    has a Grafana tunnel; both stop with `stack`.
+
+    Prometheus listens on localhost only: just the dashboard and Grafana query it.
+    Grafana is public through its tunnel (the browser loads its panels into the
+    Ray dashboard), so it serves Ray's dashboards to anonymous *viewers* only:
+    the admin login form is disabled and the admin password is random. What it
+    shows is cluster metrics (CPU, GPU, memory, Ray tasks), no secrets.
+    """
+    if "grafana" not in links:
+        return
+    prometheus_yml = RAY_METRICS_DIR / "prometheus" / "prometheus.yml"
+    grafana_ini = RAY_METRICS_DIR / "grafana" / "grafana.ini"
+    deadline = time.time() + 60  # Ray writes them asynchronously
+    while not (prometheus_yml.exists() and grafana_ini.exists()):
+        if time.time() > deadline:
+            raise TimeoutError(f"Ray wrote no metrics configs in {RAY_METRICS_DIR}")
+        time.sleep(1)
+    commands = {
+        "prometheus": [
+            "/opt/prometheus/prometheus", f"--config.file={prometheus_yml}",
+            "--storage.tsdb.path=/tmp/prometheus",
+            f"--web.listen-address=127.0.0.1:{PROMETHEUS_PORT}",
+        ],
+        "grafana": [
+            "/opt/grafana/bin/grafana", "server", "--homepath", "/opt/grafana",
+            "--config", str(grafana_ini),
+        ],
+    }  # fmt: skip
+    grafana_env = {
+        **os.environ,
+        "GF_SERVER_ROOT_URL": links["grafana"],
+        "GF_SERVER_HTTP_PORT": str(GRAFANA_PORT),
+        "GF_SECURITY_ADMIN_PASSWORD": secrets.token_hex(16),
+        "GF_AUTH_DISABLE_LOGIN_FORM": "true",
+        # Ray's guidance for embedding Grafana in the dashboard's iframes.
+        "GF_SECURITY_COOKIE_SECURE": "true",
+        "GF_SECURITY_COOKIE_SAMESITE": "none",
+        "GF_PATHS_DATA": "/tmp/grafana",
+        "GF_ANALYTICS_REPORTING_ENABLED": "false",
+        "GF_ANALYTICS_CHECK_FOR_UPDATES": "false",
+    }
+    for name, command in commands.items():
+        log = stack.enter_context((log_dir / f"{name}.log").open("w"))
+        proc = subprocess.Popen(
+            command,
+            env=grafana_env if name == "grafana" else None,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )
+        stack.callback(proc.terminate)
+
+
+def start_ray(ip: str, env: dict, gpus: int, cpus: int, dashboard: bool) -> None:
+    """The Ray head. With `dashboard`, the dashboard listens on every interface (for
+    a `modal.forward` tunnel) behind Ray's token auth: a fresh token per run in
+    RAY_TOKEN, which every Ray client in this container (Miles, `ray status`)
+    reads; a request to the tunnel without it is refused."""
+    flags = []
+    if dashboard:
+        RAY_TOKEN.parent.mkdir(parents=True, exist_ok=True)
+        RAY_TOKEN.write_text(secrets.token_urlsafe(32))
+        RAY_TOKEN.chmod(0o600)
+        os.environ["RAY_AUTH_MODE"] = env["RAY_AUTH_MODE"] = "token"
+        flags = ["--dashboard-host=0.0.0.0", f"--dashboard-port={DASHBOARD_PORT}"]
+    subprocess.run(
+        [
+            "ray", "start", "--head", "--port=6379", f"--node-ip-address={ip}",
+            f"--num-gpus={gpus}", f"--num-cpus={cpus}", "--disable-usage-stats",
+            *flags,
+        ],
+        env=env,
+        check=True,
+    )  # fmt: skip
+
+
+def print_dashboard(links: dict) -> None:
+    """The tunnel URLs, and how to get the token (never printed itself)."""
+    task = os.environ.get("MODAL_TASK_ID", "CONTAINER_ID")
+    grafana = f"Grafana: {links['grafana']} (view-only)\n" if "grafana" in links else ""
+    print(
+        f"Ray dashboard: {links['ray']}\n{grafana}"
+        # pbcopy: the file has no trailing newline, so zsh shows a `%` after it
+        # on screen, which is easy to copy by mistake. sleep: piped, `modal
+        # container exec` drops the output of a command that exits at once
+        # (about half the time, measured).
+        f"  token: modal container exec {task} -- sh -c 'cat {RAY_TOKEN}; sleep 1'"
+        " | pbcopy\n"
+        f"  shell: modal container exec {task} ray status",
+        flush=True,
+    )
+
+
+def start_env_server(env: dict, run_dir: Path) -> subprocess.Popen:
+    """The consultation environment as a sidecar on localhost, from its own venv.
+
+    It holds the judge (and the patient simulator), so the judge cache and the
+    Weave traces (one per finished episode, project rl-finetune) come from here.
+    """
+    server_env = env | {
+        "PYTHONPATH": "/root",  # rubricrl's source; nothing of Miles'
+        "RUBRICRL_DATA": str(HB),
+        "RUBRICRL_WEAVE": "rl-finetune",
+        "RUBRICRL_TRACE_RUN": run_dir.name,
+    }
+    log = (run_dir / "env_server.log").open("w")
+    proc = subprocess.Popen(
+        [
+            f"{ENV_VENV}/bin/python", "-m", "uvicorn", "rubricrl.env.server:app",
+            "--host", "127.0.0.1", "--port", str(ENV_PORT), "--log-level", "warning",
+        ],
+        env=server_env, stdout=log, stderr=subprocess.STDOUT,
+    )  # fmt: skip
+    for _ in range(120):
+        if proc.poll() is not None:
+            raise RuntimeError(f"env server exited; see {run_dir}/env_server.log")
+        try:
+            with socket.create_connection(("127.0.0.1", ENV_PORT), timeout=1):
+                print(f"env server up on :{ENV_PORT}", flush=True)
+                return proc
+        except OSError:
+            time.sleep(1)
+    proc.terminate()
+    raise RuntimeError("env server did not start in 120 s")
 
 
 @app.local_entrypoint()
@@ -314,19 +608,46 @@ def main(
     judge: str = "haiku",
     judge_effort: str = "low",
     judge_thinking: bool = False,
+    judge_prompt: str = "gepa-v1",
+    reward: str = "rm",
+    env_mode: str = "single",
+    dashboard: bool = True,
+    metrics: bool = True,
 ):
-    """--task healthbench|math, --model qwen3.5-4b|qwen3-4b, --judge haiku|sonnet."""
+    """--task healthbench|math, --model qwen3.5-4b|qwen3-4b, --judge haiku|sonnet,
+    --reward rm|env (env: episodes against rubricrl.env), --env-mode single|patient,
+    --judge-prompt gepa-v1|simple-evals-healthbench-v1 (the grader template),
+    --no-dashboard (no Ray dashboard tunnel; by default it is on, behind a token,
+    with Prometheus + Grafana for its charts), --no-metrics (dashboard only)."""
     if task not in ("healthbench", "math") or model not in MODELS:
         raise SystemExit(f"--task healthbench|math, --model one of {sorted(MODELS)}")
+    if reward not in ("rm", "env") or env_mode not in ("single", "patient"):
+        raise SystemExit("--reward rm|env, --env-mode single|patient")
+    from rubricrl.judge.prompt import TEMPLATES
+
+    if judge_prompt not in TEMPLATES:
+        raise SystemExit(f"--judge-prompt one of {sorted(TEMPLATES)}")
+    prefix = "consult" if reward == "env" and env_mode == "patient" else "healthbench"
     if (
         task == "healthbench"
-        and not (ROOT / "data/miles/healthbench_train.jsonl").exists()
+        and not (ROOT / f"data/miles/{prefix}_train.jsonl").exists()
     ):
-        raise SystemExit("run `python -m rubricrl.data.healthbench export-miles` first")
+        hint = (
+            "python -m rubricrl.sim.scenarios build --split train"
+            if prefix == "consult"
+            else "python -m rubricrl.data.healthbench export-miles"
+        )
+        raise SystemExit(f"data/miles/{prefix}_train.jsonl missing: run `{hint}`")
     if smoke_test:
         num_rollout = 2
     run_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{task}-{uuid.uuid4().hex[:6]}"
     print(f"Run ID: {run_id}")
+    tags = [task, f"reward:{reward}", f"model:{model}"]
+    if task == "healthbench":
+        thinking = "-thinking" if judge_thinking else ""
+        tags += [f"judge:{judge}-{judge_effort}{thinking}", f"prompt:{judge_prompt}"]
+        tags += [f"mode:{env_mode}"] if reward == "env" else []
+    tags += ["smoke"] if smoke_test else []
     download.remote([model], ["dapo-math-17k", "aime-2024"] if task == "math" else [])
     result = train.spawn(
         run_id,
@@ -337,6 +658,12 @@ def main(
         judge,
         judge_effort,
         judge_thinking,
+        reward=reward,
+        env_mode=env_mode,
+        judge_prompt=judge_prompt,
+        dashboard=dashboard,
+        tags=",".join(tags),
+        metrics=metrics,
     ).get()
     print(f"Results in Volume {runs_volume.name}: {result}")
 
@@ -416,3 +743,359 @@ def sync_traces(run_id: str, rate: float = 0.1, final: bool = False) -> dict:
     summary = {"records": consumed, "sampled_train_records": len(traces)} | logged
     print(summary)
     return summary
+
+
+@app.function(
+    image=image,
+    cpu=16,
+    memory=32 * 1024,
+    volumes={DATA: data_volume},
+    timeout=20 * MINUTES,
+)
+def session_check(model: str = "qwen3.5-4b", limit_s: int = 600) -> dict:
+    """CPU check of Miles' session server (`--use-session-server`) on its own: the
+    command Miles launches, with this model's TITO settings; how long until it
+    accepts connections (Miles waits 120 s), and its output if it dies."""
+    config = {
+        "host": "127.0.0.1", "port": 20007, "instance_id": "check-0",
+        "backend_url": "http://127.0.0.1:20008", "timeout": None,
+        "hf_checkpoint": str(DATA / "models" / model),
+        "chat_template_path": str(
+            MILES / "miles/utils/chat_template_utils/templates/qwen3.5_fixed.jinja"
+        ),
+        "tito_model": TITO[model],
+        "apply_chat_template_kwargs": {"preserve_thinking": True},
+        "use_rollout_routing_replay": False, "use_rollout_indexer_replay": False,
+        "use_sampling_support_replay": False, "sglang_speculative_algorithm": None,
+        "num_layers": 32, "moe_router_topk": None, "save_debug_trajectory_data": None,
+        "lora_rank": 0, "lora_adapter_path": None, "lora_train_only": False,
+        "use_session_server": True, "session_message_matcher": "strict",
+        "pause_generation_mode": "retract",
+        "session_sample_picker_path":
+            "miles.rollout.session.v2.picker_hub.drop_same_prompt_retries",
+        "session_sample_postprocessor_path":
+            "miles.rollout.session.v2.postprocessor_hub.default_postprocess",
+    }  # fmt: skip
+    t0 = time.time()
+    proc = subprocess.Popen(
+        ["/opt/sglang/bin/python", "-m", "miles.rollout.session.server",
+         "--config-json", json.dumps(config)],
+        cwd=MILES, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )  # fmt: skip
+    ready = None
+    while time.time() - t0 < limit_s and proc.poll() is None:
+        try:
+            socket.create_connection(("127.0.0.1", 20007), timeout=1).close()
+            ready = round(time.time() - t0, 1)
+            break
+        except OSError:
+            time.sleep(1)
+    exited = proc.poll()
+    proc.terminate()
+    output = proc.communicate(timeout=30)[0]
+    print(output[-6000:], flush=True)
+    return {"ready_after_s": ready, "exited_with": exited}
+
+
+RAY_CLIENT_SCRIPT = """
+import ray
+ray.init()
+
+
+@ray.remote
+def ping():
+    return "ok"
+
+
+print(ray.get(ping.remote()))
+"""
+
+
+@app.function(image=image, cpu=4, memory=8 * 1024, timeout=30 * MINUTES)
+def ray_check(hold_s: int = 0) -> dict:
+    """CPU check of the training run's `--dashboard` setup, in Miles' image:
+
+    - Ray: token auth on; a Ray client in another process (as Miles') runs a
+      task; `ray status` works; the dashboard tunnel refuses requests without
+      the token and serves them with it.
+    - Metrics: Prometheus scrapes Ray's metrics; Grafana serves Ray's dashboards
+      through its tunnel to anonymous viewers, read-only; the Ray dashboard
+      reaches both (its charts).
+
+    `--hold-s N` keeps it up N seconds to log in yourself."""
+    import urllib.error
+    import urllib.request
+
+    import ray
+
+    def get(url: str, token: str | None = None, data: bytes | None = None):
+        """(status, body) of a GET (POST with `data`); never raises."""
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(url, data=data, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.status, r.read().decode(errors="replace")
+        except urllib.error.HTTPError as e:
+            return e.code, ""
+        except OSError as e:
+            return type(e).__name__, ""
+
+    def wait(check, timeout_s: float = 120) -> bool:
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if check():
+                return True
+            time.sleep(3)
+        return False
+
+    ip = socket.gethostbyname(socket.gethostname())
+    env = {**os.environ, "RAY_ADDRESS": f"{ip}:6379"}
+    log_dir = Path("/tmp/metrics-logs")
+    log_dir.mkdir(exist_ok=True)
+    with contextlib.ExitStack() as stack:
+        links = open_dashboard(stack, env, metrics=True)
+        start_ray(ip, env, 0, 4, dashboard=True)
+        start_metrics_stack(stack, links, log_dir)
+        token = RAY_TOKEN.read_text().strip()
+        run = {"capture_output": True, "text": True, "env": env, "timeout": 300}
+        client = subprocess.run(["python", "-c", RAY_CLIENT_SCRIPT], **run)
+        status = subprocess.run(["ray", "status"], **run)
+        ray_url, grafana = links["ray"].rstrip("/"), links["grafana"].rstrip("/")
+        prom = f"http://127.0.0.1:{PROMETHEUS_PORT}"
+        out = {
+            "ray": ray.__version__,
+            "client_task": client.stdout.strip()[-200:] or client.stderr[-2000:],
+            "ray_status_ok": status.returncode == 0,
+            "container": os.environ.get("MODAL_TASK_ID"),
+        }
+        wait(lambda: isinstance(get(f"{ray_url}/api/version", token)[0], int))
+        out["dashboard"] = {
+            "no_token": get(f"{ray_url}/api/version")[0],
+            "wrong_token": get(f"{ray_url}/api/version", "not-the-token")[0],
+            "token": get(f"{ray_url}/api/version", token)[0],
+        }
+
+        def ray_series() -> int:
+            q = "/api/v1/query?query=ray_node_cpu_count"
+            code, body = get(prom + q)
+            return len(json.loads(body)["data"]["result"]) if code == 200 else 0
+
+        out["prometheus"] = {
+            "ready": get(f"{prom}/-/ready")[0],
+            "scrapes_ray": wait(lambda: ray_series() > 0),
+        }
+        wait(lambda: get(f"{grafana}/api/health")[0] == 200)
+        code, body = get(f"{grafana}/api/search?type=dash-db")
+        titles = [d["title"] for d in json.loads(body)] if code == 200 else []
+        out["grafana"] = {
+            "health": get(f"{grafana}/api/health")[0],
+            "anonymous_dashboards": titles,
+            "anonymous_write": get(
+                f"{grafana}/api/dashboards/db", data=b'{"dashboard": {"title": "x"}}'
+            )[0],  # refused: viewers only
+        }
+        out["dashboard_sees"] = {
+            k: get(f"{ray_url}/api/{k}_health", token)[0]
+            for k in ("grafana", "prometheus")
+        }
+        print(json.dumps(out, indent=1), flush=True)
+        for name in ("prometheus", "grafana"):
+            tail = (log_dir / f"{name}.log").read_text()[-1500:]
+            print(f"--- {name}.log (tail)\n{tail}", flush=True)
+        if hold_s:
+            print_dashboard(links)
+            print(f"holding for {hold_s} s", flush=True)
+            time.sleep(hold_s)
+    subprocess.run(["ray", "stop"], env=env, check=False)
+    return out
+
+
+# Runs in Miles' Python (the agent function's): argv = row JSON path, mode, port.
+ENV_CHECK_SCRIPT = """
+import asyncio, json, sys
+import websockets
+from rubricrl.env import miles_agent
+from rubricrl.env.wire import Session
+from rubricrl.rewards import miles_rm
+
+row = json.load(open(sys.argv[1]))
+mode, port = sys.argv[2], sys.argv[3]
+pid = row["metadata"]["prompt_id"]
+
+
+async def doctor(history):
+    return "Could you tell me more? If it gets worse, please seek urgent care."
+
+
+async def main():
+    prompt = miles_rm._judge().config.prompt_version  # the in-process reward's
+    async with Session(f"http://127.0.0.1:{port}") as env:
+        result, turns = await miles_agent.episode(
+            env, doctor, row["prompt"], pid, mode, "train"
+        )
+    rec = miles_agent.record(result.observation, pid, False, turns)
+    print(json.dumps({
+        "python": sys.version.split()[0], "websockets": websockets.__version__,
+        "reward": rec["reward"], "turns": turns, "criteria": len(rec["criteria"]),
+        "end_reason": rec["end_reason"], "reward_prompt": prompt,
+    }))
+
+
+asyncio.run(main())
+"""
+
+
+@app.function(
+    image=image,
+    cpu=4,
+    memory=16 * 1024,
+    secrets=[modal.Secret.from_name("anthropic"), modal.Secret.from_name("wandb")],
+    timeout=30 * MINUTES,
+)
+def env_check(mode: str = "single") -> dict:
+    """CPU check of `--reward env` minus the policy: the environment's venv builds
+    in the Miles image, the sidecar starts, and Miles' own Python (the agent
+    function's) plays one episode over the wire with a fixed doctor reply."""
+    run_dir = Path("/tmp/env-check")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    env = {**os.environ, "RUBRICRL_CACHE": "/tmp/judge.sqlite"}
+    proc = start_env_server(env, run_dir)
+    prefix = "healthbench" if mode == "single" else "consult"
+    row_path = run_dir / "row.json"
+    row_path.write_text((HB / f"{prefix}_test.jsonl").read_text().splitlines()[0])
+    try:
+        out = subprocess.run(
+            ["python", "-c", ENV_CHECK_SCRIPT, str(row_path), mode, str(ENV_PORT)],
+            capture_output=True,
+            text=True,
+            timeout=900,
+        )
+        print(out.stdout, out.stderr[-3000:], flush=True)
+        if out.returncode:
+            log = (run_dir / "env_server.log").read_text()[-3000:]
+            raise RuntimeError(f"episode failed; env server log:\n{log}")
+        return json.loads(out.stdout.strip().splitlines()[-1])
+    finally:
+        proc.terminate()
+
+
+# Runs in Miles' Python: argv = Miles' training args (JSON), train rows, eval rows.
+LOG_CHECK_SCRIPT = """
+import asyncio, json, sys
+
+argv, train_path, eval_path = json.loads(sys.argv[1]), sys.argv[2], sys.argv[3]
+sys.argv = ["train.py", *argv]
+from miles.utils.arguments import parse_args
+
+args = parse_args()  # Miles' own parser and checks: an unknown flag fails here
+from miles.ray.rollout import metrics
+from miles.utils.tracking_utils import tracking
+from miles.utils.types import Sample
+from rubricrl.env import miles_agent
+
+logged = []
+tracking.log = lambda a, m, step_key: logged.append([step_key, dict(m)])
+REPLIES = [
+    "Please see a doctor.",
+    "It is probably nothing; rest and drink water.",
+    "Go to the emergency department now if you have chest pain or trouble breathing.",
+    "I need more details: how long, how severe, and any other symptoms?",
+    "Take ibuprofen 400 mg every 6 hours with food; see a doctor if it persists.",
+    "This could be several things. Common causes include infection or strain. "
+    "Watch for fever, worsening pain or new symptoms, and seek care if they appear.",
+    "I am not able to help with that.",
+    "Monitor it at home for two days; call your doctor if it does not improve.",
+]
+
+
+async def play(rows, k, is_eval):
+    async def one(row, i):
+        async def chat(base_url, messages, request_kwargs):
+            return REPLIES[i % len(REPLIES)]
+
+        miles_agent.chat = chat  # the policy: a fixed reply per sample
+        md = dict(row["metadata"], eval=is_eval)
+        out = await miles_agent.run("http://policy", row["prompt"], {}, md)
+        s = Sample(group_index=g, index=g * k + i, prompt=row["prompt"],
+                   response=REPLIES[i % len(REPLIES)], rollout_id=0)
+        s.response_length = 100 + 50 * i
+        s.loss_mask = [1] * s.response_length
+        s.status = Sample.Status.TRUNCATED if i == 0 else Sample.Status.COMPLETED
+        s.metadata = md | (out or {})
+        s.reward = (out or {}).get("env", {}).get("reward", 0.0)
+        s.non_generation_time = ((out or {}).get("agent_metrics") or {}).get(
+            "total_tool_time", 0.0)
+        return s
+
+    samples = []
+    for g, row in enumerate(rows):  # sequential: `chat` is patched per sample
+        for i in range(k):
+            samples.append(await one(row, i))
+    return samples
+
+
+def rows(path, n):
+    return [json.loads(x) for x in open(path).read().splitlines()[:n]]
+
+
+train = asyncio.run(play(rows(train_path, 2), args.n_samples_per_prompt, False))
+evals = asyncio.run(play(rows(eval_path, 2), args.n_samples_per_eval_prompt, True))
+metrics.log_rollout_data(0, args, train, None, 60.0)
+metrics.log_eval_rollout_data(0, args, {"healthbench_val": {
+    "rewards": [s.reward for s in evals], "samples": evals,
+    "truncated": [s.status == Sample.Status.TRUNCATED for s in evals]}}, None)
+print(json.dumps({
+    "hooks": [args.custom_rollout_log_function_path,
+              args.custom_eval_rollout_log_function_path],
+    "wandb_random_suffix": args.wandb_random_suffix,
+    "logged": logged,
+}, default=str))
+"""
+
+
+@app.function(
+    image=image,
+    cpu=8,
+    memory=32 * 1024,
+    volumes={DATA: data_volume},
+    secrets=[modal.Secret.from_name("anthropic"), modal.Secret.from_name("wandb")],
+    timeout=30 * MINUTES,
+)
+def log_check() -> dict:
+    """CPU check of what a `--reward env` run logs per step, in Miles' image.
+
+    Miles parses the real training arguments (so a bad flag fails here, not on 4
+    GPUs); then 16 training and 4 eval episodes run against the environment with
+    the real judge, a fixed reply standing in for the policy, and go through
+    Miles' own rollout and eval logging, rubric hooks included. Prints every
+    key and value W&B would get. The trainer's `train/*` keys need GPUs."""
+    run_dir = Path("/tmp/log-check")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    env = {
+        **os.environ,
+        "RUBRICRL_CACHE": "/tmp/judge.sqlite",
+        "RUBRICRL_ENV_URL": f"http://127.0.0.1:{ENV_PORT}",
+        "RUBRICRL_ENV_MODE": "single",
+    }
+    proc = start_env_server(env, run_dir)
+    argv = training_args("healthbench", "qwen3.5-4b", run_dir, 20, False, "env")
+    try:
+        out = subprocess.run(
+            ["python", "-c", LOG_CHECK_SCRIPT, json.dumps(argv),
+             str(HB / "healthbench_train.jsonl"), str(HB / "healthbench_val.jsonl")],
+            capture_output=True, text=True, env=env, cwd=MILES, timeout=1500,
+        )  # fmt: skip
+    finally:
+        proc.terminate()
+    if out.returncode:
+        print(out.stdout[-3000:], out.stderr[-6000:], flush=True)
+        raise RuntimeError("log check failed")
+    result = json.loads(out.stdout.strip().splitlines()[-1])
+    for step_key, values in result["logged"]:
+        print(f"--- logged against {step_key}")
+        for k, v in sorted(values.items()):
+            print(f"  {k} = {v}")
+    print(json.dumps({k: v for k, v in result.items() if k != "logged"}), flush=True)
+    return result

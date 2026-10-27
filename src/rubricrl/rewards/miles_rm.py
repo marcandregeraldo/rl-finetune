@@ -19,6 +19,7 @@ Configured by environment variables (set in `modal/miles_rft.py`):
     RUBRICRL_JUDGE        haiku | sonnet | a model id   (default haiku)
     RUBRICRL_EFFORT       low | medium | ...            (default low)
     RUBRICRL_THINKING     1 = adaptive thinking         (default off)
+    RUBRICRL_PROMPT       a judge.prompt.TEMPLATES key  (default gepa-v1)
     RUBRICRL_CONCURRENCY  judge requests in flight      (default 64)
     RUBRICRL_CACHE        SQLite verdict cache          (default ~/.cache/rubricrl)
     RUBRICRL_LOG          JSONL, one line per sample    (default: no log)
@@ -40,7 +41,8 @@ import threading
 import time
 
 from rubricrl.data.schema import Criterion
-from rubricrl.judge.client import ClaudeJudge, JudgeConfig, VerdictCache
+from rubricrl.judge.client import ClaudeJudge, JudgeConfig, Usage, VerdictCache
+from rubricrl.judge.prompt import REWARD_PROMPT_VERSION
 from rubricrl.rewards.rubric import axis_scores, score
 
 logger = logging.getLogger(__name__)
@@ -71,6 +73,7 @@ def _judge() -> ClaudeJudge:
             effort=os.environ.get("RUBRICRL_EFFORT", "low"),
             thinking=os.environ.get("RUBRICRL_THINKING", "") == "1",
             concurrency=int(os.environ.get("RUBRICRL_CONCURRENCY", "64")),
+            prompt_version=os.environ.get("RUBRICRL_PROMPT", REWARD_PROMPT_VERSION),
         )
         _judges[loop] = ClaudeJudge(config, _cache)
     return _judges[loop]
@@ -82,6 +85,25 @@ def _log(record: dict) -> None:
         return
     with _log_lock, open(path, "a") as f:
         f.write(json.dumps(record) + "\n")
+
+
+def judge_usage(judge, verdicts) -> dict:
+    """What grading one sample cost: API calls (cache hits are free), tokens, USD."""
+    fresh = [v for v in verdicts if not v.cached]
+    usage = Usage(
+        calls=len(fresh),
+        cache_hits=len(verdicts) - len(fresh),
+        input_tokens=sum(v.input_tokens for v in fresh),
+        output_tokens=sum(v.output_tokens for v in fresh),
+    )
+    model = getattr(getattr(judge, "config", None), "model", "")
+    return {
+        "calls": usage.calls,
+        "cache_hits": usage.cache_hits,
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "cost_usd": usage.cost(model),
+    }
 
 
 async def grade_sample(judge, metadata: dict, response: str) -> dict:
@@ -112,6 +134,7 @@ async def grade_sample(judge, metadata: dict, response: str) -> dict:
         "failed": sum(m is None for m in met),
         "chars": len(answer),
         "response": answer,
+        "judge": judge_usage(judge, verdicts),
     }
 
 
@@ -126,4 +149,9 @@ async def healthbench_reward(args, sample, **kwargs) -> float:
         "status": str(getattr(sample, "status", "")),
     }
     _log(record)
+    if isinstance(sample.metadata, dict):  # for the W&B rubric metrics (miles_log)
+        sample.metadata["rubric"] = {
+            k: record[k] for k in ("score", "axes", "failed", "chars", "judge")
+        } | {"criteria": [{"points": c["points"], "met": c["met"]}
+                          for c in record["criteria"]]}  # fmt: skip
     return record["reward"]

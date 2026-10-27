@@ -57,3 +57,16 @@ def test_reward_entry_point(tmp_path, monkeypatch):
     assert rec["score"] is None
     assert rec["failed"] == len(sample.metadata["train_criteria"])
     assert rec["tokens"] == 3
+
+
+def test_judge_usage_counts_only_fresh_calls():
+    from rubricrl.judge.client import Verdict
+
+    judge = SimpleNamespace(config=SimpleNamespace(model="claude-haiku-5-5"))
+    verdicts = [
+        Verdict(True, input_tokens=2000, output_tokens=100),
+        Verdict(False, cached=True, input_tokens=2000, output_tokens=100),  # free
+    ]
+    u = miles_rm.judge_usage(judge, verdicts)
+    assert (u["calls"], u["cache_hits"], u["input_tokens"]) == (1, 1, 2000)
+    assert u["cost_usd"] == pytest.approx((2000 * 0.10 + 100 * 0.50) / 1e6)

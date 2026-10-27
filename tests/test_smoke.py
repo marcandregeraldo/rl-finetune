@@ -20,6 +20,12 @@ MODULES = [
     "rubricrl.observe",
     "rubricrl.rewards.miles_rm",
     "rubricrl.rewards.rubric",
+    "rubricrl.llm",
+    "rubricrl.sim.patient",
+    "rubricrl.sim.scenario",
+    "rubricrl.sim.scenarios",
+    "rubricrl.env.miles_agent",
+    "rubricrl.env.wire",
 ]
 # Imported by Miles' reward hook, or by Modal inside the Miles image.
 IN_MILES_IMAGE = [
@@ -28,6 +34,8 @@ IN_MILES_IMAGE = [
     "src/rubricrl/judge/prompt.py",
     "src/rubricrl/rewards/miles_rm.py",
     "src/rubricrl/rewards/rubric.py",
+    "src/rubricrl/env/miles_agent.py",
+    "src/rubricrl/env/wire.py",
     "modal/miles_rft.py",
     "modal/sample.py",
 ]
@@ -71,6 +79,15 @@ def test_calibrate_app_loads():
     assert rft.sync_traces is not None and rft.COMMIT_EVERY_S > 0
 
 
+def test_optimize_app_loads():
+    pytest.importorskip("modal")
+    app = _load(ROOT / "modal" / "optimize.py")
+    assert app.app.name == "rubricrl-optimize" and app.CACHES == (
+        "judge.sqlite",
+        "llm.sqlite",
+    )
+
+
 def test_without_weave_installed():
     """The base install and the Miles image don't have weave: nothing else needs it."""
     import subprocess
@@ -80,6 +97,7 @@ def test_without_weave_installed():
         "import sys; sys.modules['weave'] = None\n"
         "import rubricrl.rewards.miles_rm, rubricrl.judge.client\n"
         "import rubricrl.analysis.calibrate, rubricrl.evals.run, rubricrl.observe\n"
+        "import rubricrl.sim.scenarios, rubricrl.sim.patient\n"
     )
     subprocess.run([sys.executable, "-c", code], check=True)
 
@@ -117,7 +135,8 @@ def test_cluster_check_needs_gpus():
 
 CLIS = {
     "rubricrl.data.healthbench": {"download", "stats", "export-miles"},
-    "rubricrl.analysis.calibrate": {"estimate", "run", "report"},
+    "rubricrl.analysis.calibrate": {"estimate", "run", "report", "vote", "lengths"},
+    "rubricrl.judge.optimize": {"splits", "run", "compare"},
     "rubricrl.evals.run": {"score", "table", "compare", "physician"},
 }
 
@@ -145,3 +164,50 @@ def test_cli_options_match_the_functions_they_forward_to():
         (calibrate.main.commands["run"], calibrate.run),
     ]:
         assert {p.name for p in cmd.params} == set(inspect.signature(fn).parameters)
+
+
+def test_miles_side_of_the_environment_needs_no_openenv():
+    """Miles' Python gets neither openenv's server stack nor weave/wandb."""
+    import subprocess
+    import sys
+
+    code = (
+        "import sys\n"
+        "for m in ('openenv', 'weave', 'wandb', 'fastapi', 'gradio'):\n"
+        "    sys.modules[m] = None\n"
+        "import rubricrl.env.miles_agent, rubricrl.env.wire\n"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)
+
+
+def test_miles_env_args(tmp_path):
+    pytest.importorskip("modal")
+    rft = _load(ROOT / "modal" / "miles_rft.py")
+    for mode, prefix, seq in (
+        ("single", "healthbench", "10240"),
+        ("patient", "consult", "16384"),
+    ):
+        args = rft.training_args(
+            "healthbench", "qwen3.5-4b", tmp_path / "run", 2, True, "env", mode
+        )
+        flags = [a for a in args if a.startswith("--")]
+        assert len(flags) == len(set(flags)), "a flag is set twice"
+        assert args[args.index("--custom-agent-function-path") + 1] == (
+            "rubricrl.env.miles_agent.run"
+        )
+        assert args[args.index("--custom-rm-path") + 1] == (
+            "rubricrl.env.miles_agent.reward_func"
+        )
+        assert args[args.index("--tito-model") + 1] == "qwen35"
+        assert args[args.index("--max-seq-len") + 1] == seq
+        assert "--use-session-server" in args
+        assert "--apply-chat-template" not in args  # the session server renders it
+        assert args[args.index("--prompt-data") + 1].endswith(f"{prefix}_train.jsonl")
+        assert args[args.index("--custom-rollout-log-function-path") + 1] == (
+            "rubricrl.rewards.miles_log.log_rollout"
+        )
+    rm = rft.training_args("healthbench", "qwen3.5-4b", tmp_path / "run", 2, True)
+    assert "--apply-chat-template" in rm and "--use-session-server" not in rm
+    assert "--custom-eval-rollout-log-function-path" in rm
+    math = rft.training_args("math", "qwen3.5-4b", tmp_path / "run", 2, True)
+    assert "--custom-rollout-log-function-path" not in math
