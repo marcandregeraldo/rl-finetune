@@ -136,6 +136,14 @@ def test_cluster_check_needs_gpus():
 CLIS = {
     "rubricrl.data.healthbench": {"download", "stats", "export-miles"},
     "rubricrl.analysis.calibrate": {"estimate", "run", "report", "vote", "lengths"},
+    "rubricrl.analysis.figures": {
+        "calibration",
+        "length-bias",
+        "gepa",
+        "baselines",
+        "training",
+        "all",
+    },  # fmt: skip
     "rubricrl.judge.optimize": {"splits", "run", "compare"},
     "rubricrl.evals.run": {"score", "table", "compare", "physician"},
 }
@@ -211,3 +219,48 @@ def test_miles_env_args(tmp_path):
     assert "--custom-eval-rollout-log-function-path" in rm
     math = rft.training_args("math", "qwen3.5-4b", tmp_path / "run", 2, True)
     assert "--custom-rollout-log-function-path" not in math
+    assert rm[rm.index("--lr") + 1] == "1e-06"
+    assert "--dynamic-sampling-filter-path" not in rm
+    tuned = rft.training_args("healthbench", "qwen3.5-4b", tmp_path / "run", 2, True,
+                              "env", lr=3e-6, dynamic_sampling=True)  # fmt: skip
+    assert tuned[tuned.index("--lr") + 1] == "3e-06"
+    full = rft.training_args("healthbench", "qwen3.5-4b", tmp_path / "run", 20, False)
+    assert full[full.index("--save-interval") + 1] == "5"
+    assert tuned[tuned.index("--save-interval") + 1] == "2"  # smoke: at the end
+    assert "--disable-grpo-std-normalization" not in tuned
+    dr = rft.training_args("healthbench", "qwen3.5-4b", tmp_path / "run", 20, False,
+                           "env", std_normalization=False)  # fmt: skip
+    assert "--disable-grpo-std-normalization" in dr
+    small = rft.training_args("healthbench", "qwen3.5-4b", tmp_path / "run", 20, False,
+                              "env", gpus=2, prompts_per_step=32)  # fmt: skip
+    assert small[small.index("--actor-num-gpus-per-node") + 1] == "2"
+    assert small[small.index("--rollout-batch-size") + 1] == "32"
+    assert small[small.index("--global-batch-size") + 1] == "256"
+    assert full[full.index("--actor-num-gpus-per-node") + 1] == "4"
+    assert tuned[tuned.index("--dynamic-sampling-filter-path") + 1].endswith(
+        "apply_reward_nonzero_std_filter"
+    )
+    assert len([a for a in tuned if a.startswith("--")]) == len(
+        {a for a in tuned if a.startswith("--")}
+    )
+
+
+def test_export_names_follow_the_base_layout():
+    pytest.importorskip("modal")
+    rft = _load(ROOT / "modal" / "miles_rft.py")
+    base = {"model.language_model.layers.0.mlp.up_proj.weight", "lm_head.weight",
+            "model.visual.blocks.0.attn.qkv.weight"}  # fmt: skip
+    # the FSDP checkpoint's names (Qwen3.5 run 11a3f8)
+    for key, want in (
+        ("model_state.model.model.language_model.layers.0.mlp.up_proj.weight",
+         "model.language_model.layers.0.mlp.up_proj.weight"),
+        ("model_state.model.model.visual.blocks.0.attn.qkv.weight",
+         "model.visual.blocks.0.attn.qkv.weight"),
+        ("model_state.model.lm_head.weight", "lm_head.weight"),
+        ("model.layers.0.mlp.up_proj.weight",  # a text-only name, nested
+         "model.language_model.layers.0.mlp.up_proj.weight"),
+    ):  # fmt: skip
+        assert rft.base_name(key, base) == want
+    flat = {"model.layers.0.mlp.up_proj.weight"}  # a text-only base
+    assert rft.base_name("model_state.model.model.layers.0.mlp.up_proj.weight",
+                         flat) == "model.layers.0.mlp.up_proj.weight"  # fmt: skip

@@ -79,7 +79,8 @@ app = modal.App("rubricrl-miles-rft")
 MINUTES = 60
 TIMEOUT = 6 * 60 * MINUTES
 GPU = "H100!"  # "!": never silently upgraded, so timings say which hardware
-N_GPUS = 4
+N_GPUS = 4  # the default; `--gpus 2` runs the same recipe on two
+JUDGE_CONCURRENCY = 256  # judge requests in flight; the SDK retries 429s with backoff
 GPU_USD_PER_HOUR = 3.95  # one H100 on Modal (list price): the W&B cost estimate
 ROOT = Path(__file__).parent.parent
 DATA = Path("/data")  # models and datasets (Volume rubricrl-data)
@@ -236,6 +237,11 @@ observe_image = (
 COMMIT_EVERY_S = 300  # so sync_traces can read rewards.jsonl during the run
 
 
+DYNAMIC_SAMPLING = (
+    "--dynamic-sampling-filter-path"
+    " miles.rollout.filter_hub.common_filters.apply_reward_nonzero_std_filter"
+)
+
 # The rubric's W&B metrics (per axis, penalty criteria, failed verdicts), next to
 # Miles' own; both hooks keep Miles' default logging.
 RUBRIC_LOGS = """
@@ -263,11 +269,33 @@ def training_args(
     smoke_test: bool,
     reward: str = "rm",
     env_mode: str = "single",
+    lr: float = 1e-6,
+    dynamic_sampling: bool = False,
+    save_interval: int = 5,
+    std_normalization: bool = True,
+    gpus: int = N_GPUS,
+    prompts_per_step: int = 16,
 ) -> list[str]:
     """Miles' arguments. `reward`: "rm", the in-process reward function
     (rubricrl.rewards.miles_rm), or "env", episodes against the consultation
     environment (rubricrl.env) through Miles' agentic rollout; `env_mode`
-    "single" (v1) or "patient" (v2, simulated patient)."""
+    "single" (v1) or "patient" (v2, simulated patient).
+
+    `dynamic_sampling`: DAPO's online prompt filter. A group whose samples all
+    scored the same (no advantage, nothing to learn) is dropped and fresh prompts
+    are drawn until the batch has `rollout-batch-size` useful groups; Miles logs
+    the drops with the rollout metrics.
+
+    `save_interval`: a checkpoint every N steps (and at the end), so a failed
+    save (run 3cec94 lost its only, final checkpoint to an NCCL error mid-save)
+    still leaves an earlier one, and mid-run checkpoints can be evaluated.
+
+    `std_normalization=False`: GRPO advantages are reward - group mean, not also
+    divided by the group's std (Dr. GRPO). Groups whose scores are nearly tied
+    then stop getting their tiny differences scaled up to full-size advantages.
+
+    `gpus`, `prompts_per_step`: the GPUs the trainers and engines share, and the
+    prompts per step (x 8 replies, one optimizer step per batch)."""
     ckpt = DATA / "models" / model
     if task == "math":  # Modal's tested recipe on our model and node: no judge
         data = f"""
@@ -299,7 +327,7 @@ def training_args(
         --rollout-max-prompt-len {PROMPT_TOKENS}
         --n-samples-per-eval-prompt {1 if smoke_test else 2}
         """
-        prompts, n_samples = (4, 8) if smoke_test else (16, 8)
+        prompts, n_samples = (4, 8) if smoke_test else (prompts_per_step, 8)
     else:
         val = f"{HB}/healthbench_val.jsonl" + ("@[0:8]" if smoke_test else "")
         data = f"""
@@ -311,7 +339,7 @@ def training_args(
         --rollout-max-prompt-len {PROMPT_TOKENS}
         --n-samples-per-eval-prompt {1 if smoke_test else 2}
         """
-        prompts, n_samples = (4, 8) if smoke_test else (16, 8)
+        prompts, n_samples = (4, 8) if smoke_test else (prompts_per_step, 8)
     # The agentic path renders the chat template in the session server (TITO):
     # prompts stay message lists, and the agent turns thinking off per request.
     template = (
@@ -320,6 +348,7 @@ def training_args(
         else """--apply-chat-template
         --apply-chat-template-kwargs '{"enable_thinking": false}'"""
     )
+    save_every = num_rollout if smoke_test else save_interval
     return shlex.split(
         f"""
         --train-backend fsdp
@@ -336,7 +365,7 @@ def training_args(
         --use-kl-loss --kl-loss-coef 0 --kl-loss-type low_var_kl
         --kl-coef 0 --entropy-coef 0
         --eps-clip 0.2 --eps-clip-high 0.28
-        --optimizer adam --lr 1e-6 --lr-decay-style constant
+        --optimizer adam --lr {lr} --lr-decay-style constant
         --weight-decay 0.1 --adam-beta1 0.9 --adam-beta2 0.98
         --rollout-num-gpus-per-engine 1
         --sglang-decode-log-interval 1000
@@ -346,13 +375,15 @@ def training_args(
         --gradient-checkpointing --attn-implementation flash_attention_2
         --train-env-vars '{{"PYTORCH_CUDA_ALLOC_CONF":"expandable_segments:False"}}'
         --use-dynamic-batch-size --max-tokens-per-gpu {MAX_TOKENS_PER_GPU}
-        --actor-num-nodes 1 --actor-num-gpus-per-node {N_GPUS}
+        --actor-num-nodes 1 --actor-num-gpus-per-node {gpus}
         --colocate --use-fault-tolerance
-        --save {run_dir}/checkpoints --save-interval {num_rollout if smoke_test else 20}
+        --save {run_dir}/checkpoints --save-interval {save_every}
         --no-save-optim
         --use-tensorboard --tb-project-name rubricrl --tb-experiment-name {run_dir.name}
         --use-wandb --wandb-project rl-finetune --wandb-group {run_dir.name}
         --disable-wandb-random-suffix
+        {DYNAMIC_SAMPLING if dynamic_sampling else ""}
+        {"" if std_normalization else "--disable-grpo-std-normalization"}
         {"" if task == "math" else RUBRIC_LOGS}
         """
     )
@@ -387,9 +418,14 @@ def train(
     dashboard: bool = True,
     tags: str = "",
     metrics: bool = True,
+    lr: float = 1e-6,
+    dynamic_sampling: bool = False,
+    save_interval: int = 5,
+    std_normalization: bool = True,
+    gpus: int = N_GPUS,
+    prompts_per_step: int = 16,
+    judge_concurrency: int = JUDGE_CONCURRENCY,
 ) -> str:
-    import ray
-
     ip = socket.gethostbyname(socket.gethostname())
     run_dir = RUNS / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -410,12 +446,16 @@ def train(
         "WANDB_TAGS": tags,
         # for the running cost in W&B (rubricrl.rewards.miles_log)
         "RUBRICRL_RUN_START": str(time.time()),
-        "RUBRICRL_GPUS": str(N_GPUS),
+        "RUBRICRL_GPUS": str(gpus),
+        "RUBRICRL_CONCURRENCY": str(judge_concurrency),
         "RUBRICRL_GPU_USD_PER_HOUR": str(GPU_USD_PER_HOUR),
     }
     args = training_args(
-        task, model, run_dir, num_rollout, smoke_test, reward, env_mode
-    )
+        task, model, run_dir, num_rollout, smoke_test, reward, env_mode,
+        lr=lr, dynamic_sampling=dynamic_sampling, save_interval=save_interval,
+        std_normalization=std_normalization, gpus=gpus,
+        prompts_per_step=prompts_per_step,
+    )  # fmt: skip
     (run_dir / "args.txt").write_text(shlex.join(args) + "\n")
     data_volume.reload()
     sidecar = start_env_server(env, run_dir) if reward == "env" else None
@@ -432,11 +472,12 @@ def train(
     threading.Thread(target=commit_periodically, daemon=True).start()
     try:
         links = open_dashboard(stack, env, metrics) if dashboard else {}
-        start_ray(ip, env, N_GPUS, 16, dashboard)
+        start_ray(ip, env, gpus, 16, dashboard)
         start_metrics_stack(stack, links, run_dir)
-        ray.init(address=f"{ip}:6379")
-        print(f"Ray cluster ready: {ray.cluster_resources()}", flush=True)
-        ray.shutdown()
+        # A fresh process, as Miles' own: Ray reads RAY_AUTH_MODE when it is
+        # imported, so a client in this process (imported before start_ray
+        # turned token auth on) is refused by the cluster.
+        subprocess.run(["ray", "status"], env=env, check=True, timeout=300)
         if links:
             print_dashboard(links)
         t0 = time.monotonic()
@@ -613,12 +654,24 @@ def main(
     env_mode: str = "single",
     dashboard: bool = True,
     metrics: bool = True,
+    lr: float = 1e-6,
+    dynamic_sampling: bool = False,
+    save_interval: int = 5,
+    std_normalization: bool = True,
+    gpus: int = N_GPUS,
+    prompts_per_step: int = 16,
+    judge_concurrency: int = JUDGE_CONCURRENCY,
 ):
     """--task healthbench|math, --model qwen3.5-4b|qwen3-4b, --judge haiku|sonnet,
     --reward rm|env (env: episodes against rubricrl.env), --env-mode single|patient,
     --judge-prompt gepa-v1|simple-evals-healthbench-v1 (the grader template),
     --no-dashboard (no Ray dashboard tunnel; by default it is on, behind a token,
-    with Prometheus + Grafana for its charts), --no-metrics (dashboard only)."""
+    with Prometheus + Grafana for its charts), --no-metrics (dashboard only),
+    --lr (default 1e-6), --dynamic-sampling (drop groups with no score spread),
+    --save-interval (checkpoint every N steps, default 5),
+    --no-std-normalization (Dr. GRPO advantages: reward - group mean only),
+    --gpus 2|4 (H100s, default 4), --prompts-per-step (default 16, x 8 replies),
+    --judge-concurrency (judge requests in flight, default 256)."""
     if task not in ("healthbench", "math") or model not in MODELS:
         raise SystemExit(f"--task healthbench|math, --model one of {sorted(MODELS)}")
     if reward not in ("rm", "env") or env_mode not in ("single", "patient"):
@@ -638,6 +691,8 @@ def main(
             else "python -m rubricrl.data.healthbench export-miles"
         )
         raise SystemExit(f"data/miles/{prefix}_train.jsonl missing: run `{hint}`")
+    if gpus not in (1, 2, 4, 8):
+        raise SystemExit("--gpus 1|2|4|8")
     if smoke_test:
         num_rollout = 2
     run_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{task}-{uuid.uuid4().hex[:6]}"
@@ -647,24 +702,39 @@ def main(
         thinking = "-thinking" if judge_thinking else ""
         tags += [f"judge:{judge}-{judge_effort}{thinking}", f"prompt:{judge_prompt}"]
         tags += [f"mode:{env_mode}"] if reward == "env" else []
+    tags += [f"lr:{lr:g}"] + (["dynamic-sampling"] if dynamic_sampling else [])
+    tags += [] if std_normalization else ["no-std-norm"]
+    tags += [f"gpus:{gpus}", f"prompts:{prompts_per_step}"]
     tags += ["smoke"] if smoke_test else []
     download.remote([model], ["dapo-math-17k", "aime-2024"] if task == "math" else [])
-    result = train.spawn(
-        run_id,
-        task,
-        model,
-        num_rollout,
-        smoke_test,
-        judge,
-        judge_effort,
-        judge_thinking,
-        reward=reward,
-        env_mode=env_mode,
-        judge_prompt=judge_prompt,
-        dashboard=dashboard,
-        tags=",".join(tags),
-        metrics=metrics,
-    ).get()
+    # The GPU count is part of the function's resources: set it per run.
+    result = (
+        train.with_options(gpu=f"{GPU}:{gpus}")
+        .spawn(
+            run_id,
+            task,
+            model,
+            num_rollout,
+            smoke_test,
+            judge,
+            judge_effort,
+            judge_thinking,
+            reward=reward,
+            env_mode=env_mode,
+            judge_prompt=judge_prompt,
+            dashboard=dashboard,
+            tags=",".join(tags),
+            metrics=metrics,
+            lr=lr,
+            dynamic_sampling=dynamic_sampling,
+            save_interval=save_interval,
+            std_normalization=std_normalization,
+            gpus=gpus,
+            prompts_per_step=prompts_per_step,
+            judge_concurrency=judge_concurrency,
+        )
+        .get()
+    )
     print(f"Results in Volume {runs_volume.name}: {result}")
 
 
@@ -676,25 +746,125 @@ def main(
     timeout=30 * MINUTES,
 )
 def export(run_id: str, iteration: int = 0, model: str = "qwen3.5-4b") -> str:
-    """FSDP checkpoint -> HF weights at RUN_ID/huggingface/iter_XXXXXXX (0 = latest)."""
+    """FSDP checkpoint -> HF weights at RUN_ID/huggingface/iter_XXXXXXX (0 = latest).
+
+    Not Miles' `tools/convert_fsdp_to_hf.py`: for Qwen3.5 it builds a text-only
+    model (`model.layers...`) while the checkpoint holds the full vision-language
+    model (`model.language_model.layers...`), matches 1 of 724 tensors, and loads
+    with `strict=False`, so it silently saves randomly initialised weights (the
+    first export of run 11a3f8 sampled gibberish). Here the checkpoint's own names
+    are kept, which are the base checkpoint's, and a missing text-model tensor is
+    an error rather than a silent default."""
+    import importlib.util
+
     checkpoints = RUNS / run_id / "checkpoints"
     if iteration == 0:
         iteration = int((checkpoints / "latest_checkpointed_iteration.txt").read_text())
     checkpoint = checkpoints / f"iter_{iteration:07d}"
     output = RUNS / run_id / "huggingface" / checkpoint.name
-    subprocess.run(
-        [
-            "python", str(MILES / "tools/convert_fsdp_to_hf.py"),
-            "--input-dir", str(checkpoint),
-            "--output-dir", str(output),
-            "--origin-hf-dir", str(DATA / "models" / model),
-        ],
-        cwd=MILES,
-        check=True,
-    )  # fmt: skip
+    spec = importlib.util.spec_from_file_location(
+        "convert_fsdp_to_hf", MILES / "tools/convert_fsdp_to_hf.py"
+    )
+    miles_convert = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(miles_convert)  # its checkpoint reader only
+    state = miles_convert._load_fsdp_state_dict(
+        miles_convert._detect_model_dir(str(checkpoint))
+    )
+    trained = {
+        k: v
+        for k, v in state.items()
+        if not k.startswith("optimizer") and hasattr(v, "dtype")
+    }
+    write_base_layout(trained, output, DATA / "models" / model)
     runs_volume.commit()
     print(f"Hugging Face model saved to {output}")
     return str(output.relative_to(RUNS))
+
+
+CHECKPOINT_PREFIXES = ("model_state.model.", "model_state.", "")
+
+
+def base_name(key: str, base_keys: set[str]) -> str:
+    """A checkpoint tensor's name in the base Hugging Face checkpoint: the FSDP
+    checkpoint's `model_state.model.` prefix dropped; a text-only name
+    (`model.layers...`) nested under `model.language_model.` if that is where the
+    base (a vision-language model) keeps it. Unchanged if nothing matches."""
+    for prefix in CHECKPOINT_PREFIXES:
+        if not key.startswith(prefix):
+            continue
+        name = key.removeprefix(prefix)
+        nested = "model.language_model." + name.removeprefix("model.")
+        for candidate in (name, nested):
+            if candidate in base_keys:
+                return candidate
+    for prefix in CHECKPOINT_PREFIXES[:-1]:  # no match: still drop the prefix
+        if key.startswith(prefix):
+            return key.removeprefix(prefix)
+    return key
+
+
+def torch_equal(a, b) -> bool:
+    import torch
+
+    return a.shape == b.shape and bool(torch.equal(a.float(), b.float()))
+
+
+def write_base_layout(trained: dict, output: Path, base: Path) -> None:
+    """The trained tensors as a Hugging Face checkpoint laid out like `base`.
+
+    Names follow the base (`base_name`), dtypes too (Qwen3.5 keeps the
+    linear-attention `A_log` and norms in float32), and base tensors the trainer
+    doesn't hold (the multi-token-prediction head) are copied unchanged. Every
+    text-model tensor must come from the checkpoint: a missing one raises, so an
+    export can't silently fall back to untrained or random weights. The base's
+    config, tokenizer and template files are copied alongside."""
+    import shutil
+
+    from safetensors import safe_open
+    from safetensors.torch import load_file, save_file
+
+    base_keys: set[str] = set()
+    for path in sorted(base.glob("*.safetensors")):
+        with safe_open(str(path), framework="pt") as f:
+            base_keys |= set(f.keys())  # noqa: SIM118 (safe_open has no __iter__)
+    renamed = {base_name(k, base_keys): v for k, v in trained.items()}
+    tied = renamed.get("lm_head.weight")
+    embed = renamed.get("model.language_model.embed_tokens.weight")
+    if "lm_head.weight" not in base_keys and tied is not None and embed is not None:
+        # The base ties the output layer to the embeddings (no lm_head stored);
+        # the trainer saves the shared tensor under both names.
+        if not torch_equal(tied, embed):
+            raise RuntimeError("lm_head differs from embed_tokens: not tied")
+        del renamed["lm_head.weight"]
+    unknown = sorted(set(renamed) - base_keys)
+    missing_text = sorted(
+        k for k in base_keys - set(renamed) if k.startswith("model.language_model.")
+    )
+    if unknown or missing_text:
+        raise RuntimeError(
+            f"checkpoint doesn't match {base.name}: {len(unknown)} unknown "
+            f"(e.g. {unknown[:3]}), {len(missing_text)} text-model tensors missing "
+            f"(e.g. {missing_text[:3]})"
+        )
+    out = {}
+    for path in sorted(base.glob("*.safetensors")):
+        for key, tensor in load_file(str(path)).items():
+            out[key] = renamed[key].to(tensor.dtype) if key in renamed else tensor
+    print(
+        f"export: {len(renamed)} trained tensors, "
+        f"{len(out) - len(renamed)} copied from {base.name} (not in the checkpoint)"
+    )
+    if output.exists():
+        shutil.rmtree(output)
+    output.mkdir(parents=True)
+    for path in base.iterdir():
+        if (
+            path.is_file()
+            and path.suffix != ".safetensors"
+            and path.name != ("model.safetensors.index.json")
+        ):
+            shutil.copy(path, output / path.name)
+    save_file(out, str(output / "model.safetensors"), metadata={"format": "pt"})
 
 
 @app.function(
@@ -1063,7 +1233,9 @@ print(json.dumps({
     secrets=[modal.Secret.from_name("anthropic"), modal.Secret.from_name("wandb")],
     timeout=30 * MINUTES,
 )
-def log_check() -> dict:
+def log_check(
+    lr: float = 1e-6, dynamic_sampling: bool = False, std_normalization: bool = True
+) -> dict:
     """CPU check of what a `--reward env` run logs per step, in Miles' image.
 
     Miles parses the real training arguments (so a bad flag fails here, not on 4
@@ -1080,7 +1252,10 @@ def log_check() -> dict:
         "RUBRICRL_ENV_MODE": "single",
     }
     proc = start_env_server(env, run_dir)
-    argv = training_args("healthbench", "qwen3.5-4b", run_dir, 20, False, "env")
+    argv = training_args(
+        "healthbench", "qwen3.5-4b", run_dir, 20, False, "env",
+        lr=lr, dynamic_sampling=dynamic_sampling, std_normalization=std_normalization,
+    )  # fmt: skip
     try:
         out = subprocess.run(
             ["python", "-c", LOG_CHECK_SCRIPT, json.dumps(argv),

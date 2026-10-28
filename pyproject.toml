@@ -45,6 +45,12 @@ observe = [
 env = [
     "openenv>=0.10",
 ]
+# The report's figures (src/rubricrl/analysis/figures.py; W&B reads need `observe`).
+# Its own extra: `observe` is installed in the Miles image's environment venv, and
+# plotting doesn't belong there.
+figures = [
+    "matplotlib>=3.10",
+]
 # Judge prompt optimization (src/rubricrl/judge/optimize.py): GEPA, no dependencies.
 optimize = [
     "gepa>=0.1.4",

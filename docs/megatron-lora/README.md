@@ -49,6 +49,8 @@ it is; this adds a second path next to it.
 
 1. **8 × H100 (recommended) or 4.** The reference script assumes 8. Four halves the cost
    (about $16 an hour instead of about $32) but makes out-of-memory on the first smoke test likely.
+   The personal Modal account allows **10 GPUs at once**: an 8-GPU run can't overlap any
+   4-GPU run.
 2. **Reply cap 4,096 (recommended for the first run) or 8,192.** The reference caps tokens
    per GPU at 4,096, and this model's sequences can't be packed.
 3. **Before or after the interview.** The morning of Wed 28 is reserved for debugging rep 2
