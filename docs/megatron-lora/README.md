@@ -85,7 +85,7 @@ it is; this adds a second path next to it.
 5. **Smoke test** (about 30 minutes, about $15–20; loading 70 GB of weights is a large part):
 
    ```bash
-   uv run modal run --detach modal/miles_rft.py --backend megatron \
+   uv run modal run --detach modal/miles_rft.py::main --backend megatron \
      --model qwen3.6-35b-a3b --reward env --smoke-test
    ```
 
@@ -102,7 +102,7 @@ it is; this adds a second path next to it.
    8 GPUs):
 
    ```bash
-   uv run modal run --detach modal/miles_rft.py --backend megatron \
+   uv run modal run --detach modal/miles_rft.py::main --backend megatron \
      --model qwen3.6-35b-a3b --reward env --num-rollout 20
    ```
 

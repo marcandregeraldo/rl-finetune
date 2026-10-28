@@ -178,12 +178,12 @@ uv run python -m rubricrl.evals.run score runs/samples/qwen3.5-4b.jsonl    # hai
 GRPO (Modal):
 
 ```bash
-uv run modal run modal/miles_rft.py --task math --smoke-test    # the pipeline, no judge
-uv run modal run modal/miles_rft.py --smoke-test                # 2 steps with the judge
-uv run modal run modal/miles_rft.py --smoke-test --reward env   # the same, through the environment
-uv run modal run modal/miles_rft.py --smoke-test --reward env --env-mode patient
-uv run modal run --detach modal/miles_rft.py --num-rollout 60
-uv run modal run --detach modal/miles_rft.py --reward env --no-dashboard  # without the Ray dashboard and Grafana (on by default)
+uv run modal run modal/miles_rft.py::main --task math --smoke-test    # the pipeline, no judge
+uv run modal run modal/miles_rft.py::main --smoke-test                # 2 steps with the judge
+uv run modal run modal/miles_rft.py::main --smoke-test --reward env   # the same, through the environment
+uv run modal run modal/miles_rft.py::main --smoke-test --reward env --env-mode patient
+uv run modal run --detach modal/miles_rft.py::main --num-rollout 60
+uv run modal run --detach modal/miles_rft.py::main --reward env --no-dashboard  # without the Ray dashboard and Grafana (on by default)
 uv run modal run modal/miles_rft.py::ray_check --hold-s 600            # try the dashboard + Grafana login (CPU, ~$0.05)
 uv run modal run modal/miles_rft.py::log_check                         # every key a step logs to W&B (CPU, ~$0.10)
 uv run modal run modal/miles_rft.py::sync_traces --run-id RUN_ID    # any time; --final at the end

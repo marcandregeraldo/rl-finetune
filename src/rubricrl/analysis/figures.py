@@ -9,6 +9,7 @@ history. Rerun after new results land; nothing here is copied from the report.
     python -m rubricrl.analysis.figures calibration          # §4: balanced F1 per judge
     python -m rubricrl.analysis.figures length-bias          # §4.1: "met" by length
     python -m rubricrl.analysis.figures gepa                 # §4.1: GEPA's candidates
+    python -m rubricrl.analysis.figures self-hosted          # §4.2: open-model judges
     python -m rubricrl.analysis.figures baselines            # §7: eval scores, 95% CIs
     python -m rubricrl.analysis.figures training --run aqcpypgj --run <id> ...  # §6
 
@@ -133,8 +134,24 @@ def _pct(ax) -> None:
 # --- Names ---------------------------------------------------------------------
 
 
+# Self-hosted judges (`modal/miles_rft.py` JUDGE_MODELS): their model cards' names.
+OPEN_MODELS = {
+    "gpt-oss-120b": "gpt-oss-120b",
+    "gpt-oss-20b": "gpt-oss-20b",
+    "qwen3.6-35b-a3b": "Qwen3.6-35B-A3B",
+    "qwen3.5-4b": "Qwen3.5-4B",
+}
+
+
+def _self_hosted(r: dict) -> bool:
+    return r["model"] in OPEN_MODELS
+
+
 def _model(model: str) -> str:
-    """'claude-haiku-5-5' -> 'Haiku 5.5'; 'haiku' -> 'Haiku'."""
+    """'claude-haiku-5-5' -> 'Haiku 5.5'; 'haiku' -> 'Haiku'; open models as
+    their model cards name them."""
+    if model in OPEN_MODELS:
+        return OPEN_MODELS[model]
     parts = model.removeprefix("claude-").split("-")
     return " ".join([parts[0].title(), ".".join(parts[1:])]).strip()
 
@@ -155,7 +172,13 @@ def _version(r: dict) -> str:
 
 
 def judge_name(r: dict) -> str:
-    """A calibration result -> 'Haiku 5.5, low + thinking, gepa-v1'."""
+    """A calibration result -> 'Haiku 5.5, low + thinking, gepa-v1'; open models:
+    gpt-oss's reasoning effort, nothing for Qwen (thinking off)."""
+    if _self_hosted(r):
+        effort = (
+            f"reasoning {r['effort']}, " if r["model"].startswith("gpt-oss") else ""
+        )
+        return f"{_model(r['model'])}, {effort}{_prompt(_version(r))}"
     effort = r["effort"] + (" + thinking" if r["thinking"] else "")
     return f"{_model(r['model'])}, {effort}, {_prompt(_version(r))}"
 
@@ -177,9 +200,10 @@ def _calibration_color(r: dict) -> str:
 
 def calibration(src: Path = calibrate.OUT, out: Path = OUT, n: int = 1000) -> Path:
     """Balanced F1 of each judge configuration on the same `n` judgments, with
-    the physicians' agreement with each other as the ceiling."""
+    the physicians' agreement with each other as the ceiling. Claude judges only
+    (the self-hosted ones: `self_hosted`)."""
     plt = _plt()
-    results = load_calibration(src, n)
+    results = [r for r in load_calibration(src, n) if not _self_hosted(r)]
     results.sort(key=lambda r: r["judge"]["overall"]["f1_balanced"])
     f1 = [r["judge"]["overall"]["f1_balanced"] for r in results]
     ceiling = results[0]["physicians_all"]["overall"]["f1_balanced_mean"]
@@ -269,6 +293,103 @@ def length_bias(
     judge = f"{_model(by_label[REWARD]['model'])}, effort {by_label[REWARD]['effort']}"
     ax.set_title(f'Share of "met" by completion length ({judge}, n={n:,})')
     return _save(fig, out, "length-bias", "Length bias")
+
+
+# --- Self-hosted judges (§4.2) ----------------------------------------------------
+
+
+def self_hosted(
+    src: Path = calibrate.OUT,
+    out: Path = OUT,
+    n: int = 1000,
+    root: Path = healthbench.RAW,
+) -> list[Path]:
+    """Open-model judges against the Claude reward's: balanced F1 per model and
+    prompt (orange simple-evals', blue `gepa-v1`, Haiku's rows in bold), and
+    the share of "met" by length quartile with `gepa-v1`."""
+    plt = _plt()
+    results = load_calibration(src, n)
+    by_label = {r["label"]: r for r in results}
+    missing = [x for x in (OLD, REWARD) if x not in by_label]
+    if missing:
+        raise click.ClickException(f"no calibration result for {missing} (n={n})")
+    rows = [r for r in results if _self_hosted(r)] + [by_label[OLD], by_label[REWARD]]
+    if len(rows) == 2:
+        raise click.ClickException(f"no self-hosted calibration results (n={n})")
+    rows.sort(key=lambda r: r["judge"]["overall"]["f1_balanced"])
+    f1 = [r["judge"]["overall"]["f1_balanced"] for r in rows]
+    ceiling = rows[0]["physicians_all"]["overall"]["f1_balanced_mean"]
+    lo, hi = min(f1 + [ceiling]) - 0.03, max(f1 + [ceiling]) + 0.03
+    fig, ax = plt.subplots(figsize=(7, 0.3 * len(rows) + 1.0))
+    y = range(len(rows))
+    colors = [PROMPT_COLORS.get(_version(r), REF) for r in rows]
+    ax.hlines(y, lo, f1, color=INK, alpha=0.25, lw=0.6)
+    ax.scatter(f1, y, s=56, color=colors, zorder=3)
+    for yi, x, r in zip(y, f1, rows, strict=True):
+        weight = "normal" if _self_hosted(r) else "bold"
+        ax.annotate(f"{x:.3f}", (x, yi), xytext=(7, 0), textcoords="offset points",
+                    va="center", fontsize=8, weight=weight)  # fmt: skip
+    ax.axvline(ceiling, color=REF, lw=1)
+    ax.annotate(f"physicians vs each other {ceiling:.3f}", (ceiling, len(rows) - 0.4),
+                xytext=(-4, 0), textcoords="offset points", ha="right",
+                va="bottom", fontsize=8)  # fmt: skip
+    ax.set_yticks(list(y), [judge_name(r) for r in rows])
+    for tick, r in zip(ax.get_yticklabels(), rows, strict=True):
+        if not _self_hosted(r):
+            tick.set_fontweight("bold")
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(-0.6, len(rows) + 0.3)
+    ax.grid(axis="y", visible=False)
+    ax.spines["left"].set_visible(False)
+    ax.set_xlabel(f"balanced F1 against physicians ({n:,} meta-eval judgments)")
+    ax.set_title("Self-hosted judges vs Haiku (bold): agreement with physicians")
+    paths = [_save(fig, out, "judge-calibration-self-hosted", "Self-hosted judges")]
+
+    gepa_rows = sorted(
+        (
+            r
+            for r in results
+            if _self_hosted(r) and _version(r) == REWARD_PROMPT_VERSION
+        ),
+        key=lambda r: -r["judge"]["overall"]["f1_balanced"],
+    )
+    reward, *opens = length_rows([by_label[REWARD], *gepa_rows], root)
+    x = range(len(reward))
+    lines = [("physicians", [b["physician_rate_met"] for b in reward], REF),
+             ("Haiku 5.5 low (the reward)", [b["judge_rate_met"] for b in reward],
+              BLUE)]  # fmt: skip
+    lines += [
+        (_model(r["model"]), [b["judge_rate_met"] for b in bs], color)
+        for r, bs, color in zip(
+            gepa_rows, opens, (AQUA, SERIES[4], SERIES[6], SERIES[3]), strict=False
+        )
+    ]
+    fig, ax = plt.subplots(figsize=(7, 3.4))
+    for _, ys, color in lines:
+        ax.plot(x, ys, color=color, marker="o", ms=6)
+    ends = sorted(lines, key=lambda line: line[1][-1])
+    label_y = [ends[0][1][-1]]
+    for _, ys, _ in ends[1:]:  # spread the end labels 5 points apart
+        label_y.append(max(ys[-1], label_y[-1] + 0.05))
+    for (name, ys, color), ly in zip(ends, label_y, strict=True):
+        ax.annotate(f"{name}  {ys[-1]:.0%}", (x[-1], ys[-1]), xytext=(x[-1] + 0.12, ly),
+                    textcoords="data", va="center", fontsize=8,
+                    color=color)  # fmt: skip
+    ax.set_xticks(
+        list(x),
+        [f"Q{b['bucket'] + 1}\n{b['chars_min']:,}–{b['chars_max']:,} chars"
+         for b in reward],
+    )  # fmt: skip
+    ax.set_xlim(-0.35, len(reward) - 0.4)
+    ax.set_ylim(0, 1)
+    _pct(ax)
+    ax.grid(axis="x", visible=False)
+    ax.set_ylabel('says "met"')
+    ax.set_title(
+        f'Share of "met" by completion length, {REWARD_PROMPT_VERSION} (n={n:,})'
+    )
+    paths.append(_save(fig, out, "length-bias-self-hosted", "Length bias, self-hosted"))
+    return paths
 
 
 # --- GEPA search (§4.1) ----------------------------------------------------------
@@ -548,6 +669,16 @@ def length_bias_cmd(cal_src: Path, n: int, root: Path, out: Path) -> None:
     length_bias(cal_src, out, n, root)
 
 
+@main.command("self-hosted")
+@_cal
+@_n
+@_root
+@_out
+def self_hosted_cmd(cal_src: Path, n: int, root: Path, out: Path) -> None:
+    """Self-hosted judges vs Haiku: balanced F1, and "met" by length."""
+    self_hosted(cal_src, out, n, root)
+
+
 @main.command("gepa")
 @click.option(
     "--result",
@@ -594,6 +725,7 @@ def all_cmd(run_ids: tuple[str, ...], project: str, out: Path) -> None:
     """Every figure, from the default sources."""
     calibration(out=out)
     length_bias(out=out)
+    self_hosted(out=out)
     gepa(out=out)
     baselines(out=out)
     training(run_ids, project, out)

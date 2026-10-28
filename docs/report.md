@@ -18,7 +18,7 @@ with for several turns?
 | v1 environment (single reply, OpenEnv) | done; parity with the in-process reward checked |
 | v2 environment (simulated patient) | done; 100 test scenarios; fidelity + doctor checks |
 | Baselines | physician ideal answers; Qwen3.5-4B under the old prompt, `gepa-v1` and Sonnet |
-| GRPO with Miles | 3 runs of 20 steps through the environment (§6); offline before/after on the test set for 2 of them (§7) |
+| GRPO with Miles | 4 runs of 20 steps with the Haiku judge (§6); run E with a self-hosted gpt-oss-120b judge, stopped after 50 steps at a plateau (§6.4); offline before/after on the test set for A, C, D and E's step 20 (§7) |
 
 ## 2. Data and rubrics
 
@@ -55,6 +55,11 @@ the full prompt (`judge/client.py`). The prompt was simple-evals' grader prompt,
 verbatim; since §4.1 the reward uses the GEPA-optimized `gepa-v1`, and simple-evals'
 stays the library default (`judge/prompt.py`, `TEMPLATES`). ~$0.0004 per verdict;
 a training step of 128 responses is ~1,000 verdicts, ~$0.43.
+
+Every Claude call in the project (the judge, GEPA's reflection model, the scenario
+builder, the simulated patient) goes straight to the Anthropic API through the
+official `anthropic` Python SDK, on the author's own API key: no proxy or
+third-party wrapper.
 
 **Why measure noise.** The API has no `temperature` anymore: verdicts are samples.
 Test-retest (the same items graded twice) measures that noise; it enters the RL
@@ -107,9 +112,10 @@ evolution) rewrites the grader template:
 
 The judge inside the loop is the production `ClaudeJudge` (structured output,
 effort, thinking, verdict cache), plugged into the `gepa` library through an
-adapter. DSPy was the first plan, but it would call the model through its own
-prompt format and LiteLLM, and so would tune a judge other than the one the
-reward uses.
+adapter, so the optimizer calls Claude exactly as the reward does. DSPy was the
+first plan and was dropped: it formats prompts its own way and calls models through
+a third-party wrapper (LiteLLM), so it would have tuned a judge other than the one
+the reward uses.
 
 **No leakage into the test set.**
 - **Test:** the same 1,000 judgments as §4, untouched by the optimizer.
@@ -206,6 +212,89 @@ judge (0.60).
 template sits verbatim in `judge/prompt.py`. Rerunning the calibration from it
 reproduces 0.655 exactly from the cache. Patient mode (v2) still grades with the
 trajectory prompt, which is built on simple-evals' prompt and is not yet ported.
+
+### 4.2 A self-hosted judge
+
+The API credit ran out after run D, so the next run needs a judge on our own GPUs. Four
+open models, served by SGLang on H100s, went through the same calibration as Haiku: the
+same 1,000 test judgments and 200 regraded, with simple-evals' prompt and with `gepa-v1`
+unchanged. Temperature 0, the verdict JSON forced by constrained decoding; gpt-oss
+reasons at effort low, Qwen has thinking off. Each configuration is a W&B run (tag
+`self-hosted`, grouped with Haiku's) with a Weave trace per verdict; the setup is in
+`docs/self-hosted-judge/README.md`.
+
+**Results** (test set, n=1,000; physicians vs each other: 0.672, 78% "met", 74% → 81% from the shortest to the longest quartile):
+
+| Judge (GPUs) | Prompt | Balanced F1 | Seen / held-out categories | F1 met / not met | Says "met" | Retest κ | "Met", shortest → longest quartile |
+|---|---|---|---|---|---|---|---|
+| Haiku low (API) | simple-evals' | 0.558 | 0.552 / 0.580 | 0.652 / 0.463 | 43% | 0.60 | 0.53 → 0.30 |
+| Haiku low (API) | `gepa-v1`: the reward | 0.655 | 0.654 / 0.657 | 0.819 / 0.491 | 70% | 0.74 | 0.68 → 0.68 |
+| gpt-oss-120b (2) | simple-evals' | 0.693 | 0.704 / 0.634 | 0.866 / 0.520 | 79% | 0.82 | 0.74 → 0.82 |
+| **gpt-oss-120b (2)** | **`gepa-v1`** | **0.714** | 0.712 / **0.719** | 0.884 / **0.543** | 82% | **0.87** | 0.74 → 0.88 |
+| gpt-oss-20b (1) | simple-evals' | 0.654 | 0.677 / 0.554 | 0.835 / 0.474 | 75% | 0.87 | 0.67 → 0.78 |
+| gpt-oss-20b (1) | `gepa-v1` | 0.674 | 0.686 / 0.615 | 0.855 / 0.494 | 78% | 0.72 | 0.69 → 0.83 |
+| Qwen3.6-35B-A3B (2) | simple-evals' | 0.643 | 0.643 / 0.635 | 0.802 / 0.483 | 67% | 0.96 | 0.62 → 0.74 |
+| Qwen3.6-35B-A3B (2) | `gepa-v1` | 0.671 | 0.676 / 0.645 | 0.852 / 0.490 | 77% | 1.00 | 0.72 → 0.82 |
+| Qwen3.5-4B (1) | simple-evals' | 0.642 | 0.653 / 0.559 | 0.820 / 0.463 | 72% | 1.00 | 0.64 → 0.75 |
+| Qwen3.5-4B (1) | `gepa-v1` | 0.643 | 0.650 / 0.591 | 0.873 / 0.413 | 87% | 1.00 | 0.80 → 0.88 |
+
+![Balanced F1 of the self-hosted judges and Haiku against physicians](figures/judge-calibration-self-hosted.svg)
+
+*Balanced F1 against physicians on the same test set: open models with each prompt (orange simple-evals', blue `gepa-v1`) and the two Haiku configurations (bold); the vertical line is physicians against each other.*
+
+Links (W&B): gpt-oss-120b [simple-evals'](https://forge.coreweave.com/wandb/marcandregeraldo-none/rl-finetune/runs/rp6xzgtq), [`gepa-v1`](https://forge.coreweave.com/wandb/marcandregeraldo-none/rl-finetune/runs/2clefcxw);
+gpt-oss-20b [simple-evals'](https://forge.coreweave.com/wandb/marcandregeraldo-none/rl-finetune/runs/55rlxuu4), [`gepa-v1`](https://forge.coreweave.com/wandb/marcandregeraldo-none/rl-finetune/runs/qjl9gxe7);
+Qwen3.6-35B-A3B [simple-evals'](https://forge.coreweave.com/wandb/marcandregeraldo-none/rl-finetune/runs/xhbvlwq6), [`gepa-v1`](https://forge.coreweave.com/wandb/marcandregeraldo-none/rl-finetune/runs/lpg5m6q2);
+Qwen3.5-4B [simple-evals'](https://forge.coreweave.com/wandb/marcandregeraldo-none/rl-finetune/runs/f5srvj02), [`gepa-v1`](https://forge.coreweave.com/wandb/marcandregeraldo-none/rl-finetune/runs/oswohhho).
+GPU cost: $0.06–0.17 per configuration (Haiku `gepa-v1`: $0.52 of API), about $20 for
+the night including the checks below.
+
+**What it shows.**
+- **Every open model beats Haiku with simple-evals' prompt; with `gepa-v1`, three of
+  four beat it (0.671–0.714).** gpt-oss-120b's gain is on both classes: against the physician majority,
+  gpt-oss-120b with `gepa-v1` wrongly fails 49 items Haiku-`gepa-v1` wrongly fails 134
+  of, and still catches 83 of the 112 "not met" items (Haiku: 86). F1 on "not met",
+  the gap §4.1 left open, rises from 0.491 to 0.543.
+- **`gepa-v1` transfers.** Optimized on Haiku, it improves every open model but the
+  4B. On gpt-oss-120b it gains most on the 6 categories GEPA never saw (0.634 →
+  0.719).
+- **None is stricter on long answers.** All grow more lenient with length, as
+  physicians do (74% → 81%); gpt-oss-120b more so (74% → 88%). That is the direction to
+  watch: a reward that pays for length.
+- **Bigger is better within a family**, and Qwen3.5-4B, the policy itself, is the
+  weakest judge: with `gepa-v1` it says "met" 87% of the time.
+
+![Share of "met" by completion-length quartile, gepa-v1](figures/length-bias-self-hosted.svg)
+
+*Share of "met" by completion-length quartile with `gepa-v1`: physicians, Haiku low (the reward until now) and each open model.*
+
+**On the reward's own data, the judges disagree.** The meta-eval has only consensus
+criteria. Replaying run D's first ~1,700 training verdicts (the policy's replies, the
+reward's conversation-specific criteria) through each open judge (`analysis/replay.py`):
+
+| Judge (GPUs) | Time for the step | Agrees with Haiku's verdicts (κ) | Says "met" (Haiku: 32%) | Reward correlation with Haiku's |
+|---|---|---|---|---|
+| gpt-oss-120b (2 / 4) | 78 s / 50 s | 67% (0.31) | 43% | 0.45 |
+| gpt-oss-20b (1 / 2) | 63 s / 43 s | 68% (0.29) | 37% | 0.50 |
+| Qwen3.6-35B-A3B (2) | 122 s | 61% (0.24) | 53% | 0.51 |
+
+The open judges agree more with each other (gpt-oss-20b vs 120b: 81%, κ 0.60) than with
+Haiku, which is the strictest. With no physician labels on these items, the data can't
+say which judge is right; what it does say is that a run with an open judge optimizes a
+different reward from A–D.
+
+**Decision.** The gate set before the night: balanced F1 ≥ 0.625, "met" ≥ 50% on the
+longest quartile, one step's verdicts in ≤ 60 s. gpt-oss-120b with `gepa-v1` passes all
+three on 4 GPUs (two replicas of 2): 0.714, 88%, 50 s. It is the judge for the next run.
+
+*Caveats.*
+- gpt-oss-120b agrees with physicians more than they agree with each other. A judge that
+  matches the physician majority can, but OpenAI built HealthBench, and whether the
+  meta-eval was in gpt-oss's training data isn't public.
+- Results across runs are comparable only on a fixed offline judge: the next run's
+  held-out scores should be graded by Haiku or Sonnet once there is credit again.
+- One SGLang server grades 15–25 verdicts/s on these ~2,800-token prompts, about as
+  fast for the 4B as for the 20B; speed comes from replicas, not from a smaller model.
 
 ## 5. From expert data to an environment
 
@@ -331,7 +420,7 @@ per episode from the environment (every eval episode, 10% of training ones), wit
 child per judge verdict. Each run also serves the Ray dashboard (behind a token)
 and Grafana (view-only), each through its own tunnel.
 
-### 6.1 Three runs
+### 6.1 The runs
 
 Every run: 20 steps of 16 prompts × 8 replies (2,560 training episodes), the
 training half of each rubric as the reward, an in-run eval on the 64 validation
@@ -342,6 +431,7 @@ prompts × 2 replies graded on the **held-out** half, at steps 0, 10 and 20.
 | A (`aqcpypgj`) | lr 1e-6 | 0.250 → 0.248 → 0.310 | 0.011 | 1.02 → 0.90 | 8.2 | 55 s | $8.86 + $9.40 |
 | B (`vd00i7jk`) | lr 3e-6 | 0.207 → 0.255 → lost | 0.069 | 1.00 → 0.93 | 26.2 | 54 s | $8.59 + $9.56 |
 | C (`s5yq2faq`) | lr 3e-6 + dynamic sampling | 0.215 → 0.362 → **0.442** | 0.145 | 1.10 → **0.54** | 14.8 | 82 s | $10.45 + $15.94 |
+| D (`vmgc5lf8`) | C + no std-normalization; judge concurrency 256 | 0.215 → 0.361 → 0.382 | 0.106 | 1.07 → 0.79 | **4.8** | ~40 s | $7.69 + $13.98 |
 
 GPU cost is wall time × 4 GPUs × $3.95 (an estimate); judge cost is summed from
 every verdict's tokens in `rewards.jsonl`. The step-20 eval points live in each
@@ -349,8 +439,8 @@ run's `rewards.jsonl`, not in W&B (the figure's eval dots stop at step 10).
 
 **Paired by prompt** (the same 64 validation prompts, step 0 vs the last eval):
 A +0.060 [−0.010, 0.127], 31 prompts better and 21 worse; B (to step 10) +0.048
-[−0.033, 0.127]; C **+0.226 [0.120, 0.336]**, 46 better and 13 worse. Only C clears
-the noise.
+[−0.033, 0.127]; C **+0.226 [0.120, 0.336]**, 46 better and 13 worse; D **+0.167
+[0.078, 0.251]**, 43 better and 13 worse. C and D clear the noise.
 
 ### 6.2 What the runs showed
 
@@ -388,6 +478,18 @@ the noise.
   §7 asks how much of the gain that is.
 - **Penalties did not rise.** Negative criteria met on the eval: A 31% → 30%, C
   29% → 25%. The policy is not buying points with more mistakes.
+- **Without std-normalization, training is calmer.** D changes one thing from C:
+  the advantage is reward − group mean, no longer divided by the group's standard
+  deviation (Dr. GRPO). Dividing by a small std turns near-ties into full-size
+  advantages, so the noise in nearly tied groups gets amplified. Without it, D's
+  grad norm stayed at a median 0.47 (C: 1.73) with a maximum of 4.8 (C: 14.8),
+  entropy fell less (1.07 → 0.79, C: → 0.54), and replies grew less (eval tokens
+  +47%, C: +61%). Its in-run held-out gain is a little smaller (+0.167 vs +0.226),
+  with overlapping intervals; §7.1 compares them on the test set.
+- **Judge concurrency was the cheap speed-up.** Raising the judge's requests in
+  flight from 64 to 256 cut the environment's time per episode from ~12 s to ~3–4 s,
+  and D's steps took ~40 s against C's ~80 s on the same 4 GPUs, with no failed
+  verdicts (any throttling was absorbed by the SDK's retries).
 - **Infrastructure failures.**
   - B lost its final checkpoint: an NCCL error inside PyTorch's checkpoint writer
     (`gather_object`) killed the save at step 20, and it was the only save. Runs now
@@ -398,10 +500,13 @@ the noise.
     export now keeps the checkpoint's names and fails on any missing text-model
     tensor, and each export is checked against the base model (median relative
     difference: A 0.0002, C 0.001).
+  - D's recipe at 32 prompts per step on 2 GPUs (`5ec2f8`) ran out of GPU memory
+    before its first checkpoint, after grading the step-0 eval and 793 training
+    episodes. 16 prompts on 4 GPUs remains the configuration that runs.
 
 ![Training metrics per rollout step from W&B](figures/training.svg)
 
-*Runs A (blue), B (orange) and C (green) per rollout step: reward on the training half with the held-out eval, reply length, truncation, KL to the base model, entropy, groups with no signal, negative criteria met.*
+*Runs A (blue), B (orange), C (green) and D (gold) per rollout step: reward on the training half with the held-out eval, reply length, truncation, KL to the base model, entropy, groups with no signal, negative criteria met.*
 
 ### 6.3 What to monitor, and what tonight's runs looked like
 
@@ -422,6 +527,60 @@ a later one.
 | | held-out judge (Sonnet) | C +0.045 | Haiku up, Sonnet flat | judge-specific hacks |
 | | negative criteria met | flat or down | rising with reward | which criteria |
 | | length, and length vs score | +61% in C | gain explained by length alone | length-controlled score (§7) |
+
+### 6.4 Run E: training against the self-hosted judge
+
+**Setup.** D's recipe (lr 3e-6, dynamic sampling, no std-normalization, 16 prompts × 8),
+with the reward graded by gpt-oss-120b with `gepa-v1` (§4.2) instead of Haiku. The
+container gets 8 H100s: Miles and Ray see GPUs 0–3, as before; the judge is an SGLang
+server on GPUs 4–7 (two replicas of TP2), which the reward reaches on localhost
+(`--judge-model gpt-oss-120b --judge-gpus 4`). The judge stays outside Miles' Ray
+cluster on purpose: Miles owns its placement groups and its fault-tolerance controller,
+and the judge is a fixed-size, stateless server that needs none of Ray Serve's
+scheduling. A 2-step smoke test (`ecbef5`) passed first: judge up in 286 s, 0 failed
+verdicts, no zero-variance groups.
+
+The run (`sjyp2hav`, `20261028-064104-healthbench-2849d8`) was set to 60 steps, with a
+decision at each eval whether to continue, and was stopped after step 50. The in-run
+eval is graded by gpt-oss too, so its levels can't be compared with A–D's (on D's
+replies the two judges agree on 67% of verdicts, §4.2); only the trend within E, and
+the offline test set (§7.1), can.
+
+| Held-out eval (gpt-oss) | Step 0 | 10 | 20 | 30 | 40 | 50 |
+|---|---|---|---|---|---|---|
+| Score | 0.170 | 0.219 | **0.256** | 0.198 | 0.248 | 0.210 |
+| Positive criteria met | 60.2% | 60.9% | 63.6% | 62.0% | 63.9% | 61.8% |
+| Negative criteria met | 42.4% | 39.3% | 38.0% | 42.4% | 38.3% | 40.2% |
+| Reply length (tokens, mean) | 660 | 748 | 910 | 1,413 | 1,182 | 1,212 |
+| Correlation of length and score | −0.11 | −0.04 | −0.11 | −0.17 | −0.05 | +0.01 |
+| KL to the base model (training) | – | 0.025 | 0.057 | 0.086 | 0.106 | 0.110 |
+
+**What it showed by step 20.**
+- **The reward path works at full size.** 0 failed verdicts in every step and eval; a
+  step's generation and grading took 29–70 s, and a whole step 71–106 s (median ~95 s),
+  against D's ~40 s with Haiku at concurrency 256.
+- **It learned slowly and steadily.** +0.086 on the held-out half in 20 steps, from both
+  directions: more positive criteria met and fewer negative ones. The second ten steps
+  (+0.037) are within one eval's noise; the total is not.
+- **No length gaming.** Replies grew 38%, and longer replies still score slightly
+  lower. gpt-oss-120b's leniency on long answers (§4.2) has not shown up in the reward.
+- **Calmer than D.** KL to the base model 0.057 at step 20 (D: 0.106), entropy 1.00 →
+  1.00 (D: 1.07 → 0.79), gradient norm ~0.4 with one spike to 2.4 at step 16.
+- **After step 20, a plateau.** Four evals in a row (0.256, 0.198, 0.248, 0.210, mean
+  0.228) sit within one eval's noise, while the KL to the base model doubled (0.057 →
+  0.110). The training reward stayed flat too: 5-step means of 0.10–0.14 to step 30,
+  0.20 over steps 31–40, then 0.01–0.38 per step. The policy kept moving without
+  improving on held-out criteria, so the run was stopped after step 50 (the stop rule:
+  a step-50 score clearly above the plateau, ≥ 0.29).
+- **Length moved with the drift, not with the score.** Training replies jumped from
+  ~1,000 to ~1,800 tokens at steps 31–32 and settled at 1,000–1,700; the eval's reply
+  length grew 84% (660 → 1,212 tokens), and the length–score correlation stayed at or
+  below zero: gpt-oss did not pay for length.
+- **Cost.** 8 GPUs at $31.60/h for 2 h 06 min: ~$66, of which ~$15 was the 30-minute
+  start-up (a cold container; the smoke test started in half the time). $0 of API.
+- **On the test set neither checkpoint improved much, under either judge** (step 20:
+  Haiku −0.013, gpt-oss +0.016; step 50: −0.017, +0.020; §7.1). E ties D under gpt-oss
+  and is below it under Haiku.
 
 ## 7. Baselines
 
@@ -459,9 +618,15 @@ test conversations. Differences are paired by conversation, with 95% bootstrap C
 | C (lr 3e-6 + dynamic sampling) | Haiku `gepa-v1` | **+0.087 [0.066, 0.109]** | +0.100 [0.069, 0.133] | **+0.091 [0.055, 0.126]** | +0.009 |
 | C | Sonnet | **+0.045 [0.010, 0.080]** | +0.051 [−0.000, 0.101] | **+0.066 [0.008, 0.124]** | −0.015 |
 | C | Sonnet, K = 2 | **+0.058 [0.031, 0.085]** | +0.063 [0.029, 0.099] | **+0.076 [0.036, 0.117]** | −0.013 |
+| D (C + no std-normalization) | Haiku `gepa-v1` | +0.038 [0.012, 0.063] | +0.045 [0.010, 0.083] | +0.043 [0.001, 0.084] | +0.002 |
+| E, step 20 (D's recipe, gpt-oss-120b judge, §6.4) | Haiku `gepa-v1` | −0.013 [−0.041, 0.015] | −0.030 [−0.075, 0.013] | −0.023 [−0.068, 0.022] | −0.007 |
+| E, step 50 (the last checkpoint) | Haiku `gepa-v1` | −0.017 [−0.043, 0.006] | −0.025 [−0.065, 0.012] | −0.046 [−0.089, −0.003] | +0.021 |
 
-Median reply length: base 3,400 characters, A 3,623 (+7%), C 4,454 (+31%). B has no
-checkpoint (§6.2).
+Median reply length: base 3,400 characters, A 3,623 (+7%), C 4,454 (+31%), D 3,827
+(+13%), E 4,068 (+20%) at step 20 and 4,568 (+34%) at step 50. B has no checkpoint
+(§6.2). D's verdicts were all in the cache ($0); E's cost $2.08 and $2.17. Paired, C − D
+= +0.049 [0.024, 0.076] and E − D = −0.050 [−0.082, −0.018] (step 20), −0.055 [−0.086,
+−0.026] (step 50).
 
 **Reading it.**
 - C improved on criteria the reward never used, by as much as on the ones it did
@@ -471,6 +636,57 @@ checkpoint (§6.2).
   0.62, context awareness 0.38 → 0.48; accuracy 0.54 → 0.61).
 - **Length doesn't explain it.** C's replies are 31% longer, and HealthBench rewards
   completeness, so length was the obvious confound.
+- **D learned the task, but less than C.** No train/held-out gap, and a significant
+  gain, but less than half of C's. Removing std-normalization made training calmer
+  (§6.2) and slower: one plausible reason is that nearly tied groups now give tiny
+  advantages, so each step moves the policy less (not tested).
+- **E improved under its own judge and not under Haiku.** In-run, gpt-oss-120b saw
+  +0.086 on the held-out half by step 20 (§6.4); on the test set Haiku sees no gain
+  (−0.013), and E is below D at the same step and recipe (−0.050). The axes that fell
+  are the ones a different judge would weigh differently: communication quality 0.657 →
+  0.600, instruction following 0.623 → 0.557, context awareness 0.377 → 0.330;
+  completeness rose slightly (0.518 → 0.535), accuracy is flat. This is detector 2 of
+  §8 firing: a gain under the training judge that a held-out judge doesn't see.
+
+**Both judges on the same replies.** To separate "E learned gpt-oss's taste" from "E's
+in-run gain didn't generalize", the base model, C, D and E's step 20 were graded again
+on the test set by gpt-oss-120b with `gepa-v1` (`evals.run score --base-url`, 2 H100s,
+~3.5 min per checkpoint, 0 failed verdicts), and merged with the Haiku grades
+(`evals.run merge`) so that `compare` pairs the two judges on each conversation.
+
+| Gain over the base model (full rubric) | Under Haiku `gepa-v1` | Under gpt-oss-120b `gepa-v1` | Own judge − other judge |
+|---|---|---|---|
+| C (trained on Haiku) | **+0.087** [0.066, 0.109] | **+0.062** [0.038, 0.087] | Haiku sees +0.025 more [0.001, 0.049] |
+| D (trained on Haiku) | +0.038 [0.012, 0.063] | +0.021 [−0.006, 0.047] | +0.017 [−0.010, 0.045] |
+| E step 20 (trained on gpt-oss) | −0.013 [−0.041, 0.015] | +0.016 [−0.009, 0.042] | gpt-oss sees +0.029 more [0.004, 0.057] |
+| E step 50 (trained on gpt-oss) | −0.017 [−0.043, 0.006] | +0.020 [−0.006, 0.043] | gpt-oss sees +0.037 more [0.010, 0.063] |
+
+The base model scores 0.412 under gpt-oss (0.500 under Haiku): on these replies and the
+reward's own criteria, gpt-oss is the stricter judge, the reverse of the meta-eval (§4.2).
+
+- **The judges rank the checkpoints the same way.** C is clearly best under both
+  (C − E: +0.100 under Haiku, +0.046 under gpt-oss, both significant). As an offline
+  grader, gpt-oss tells the same story as Haiku, with smaller differences.
+- **Each judge credits the policy trained on it by about 0.03 more.** C and E show it
+  in mirror image (−0.025 and +0.029, both significant), D in the same direction. This
+  is the size of what a policy learns about its own judge's taste in 20 steps, on top of
+  what transfers.
+- **As a reward, gpt-oss did not help.** At the same recipe and step, E ties D under
+  E's own judge (−0.005 [−0.031, 0.023]) and is below it under Haiku (−0.050). E's
+  in-run gain (+0.086 on the validation prompts) mostly did not carry to the test set,
+  even under gpt-oss (+0.016 on the full rubric). Most of E's shortfall against C is
+  the recipe (D ≈ E under gpt-oss); the judge swap costs the own-judge share on top.
+- **Thirty more steps changed nothing on the test set.** Step 50 − step 20: +0.003
+  [−0.019, 0.026] under gpt-oss, −0.005 [−0.029, 0.020] under Haiku. The in-run plateau
+  (§6.4) holds offline. What did change is length (+12%) and, under Haiku, communication
+  quality: 0.657 (base) → 0.600 (step 20) → 0.527 (step 50). The own-judge share grew a
+  little (+0.029 → +0.037).
+- **One thing unexplained.** Under gpt-oss, E's test gain sits on the held-out half and
+  not on the training half, at both checkpoints (step 20: +0.064 vs +0.006; step 50:
+  +0.048 vs +0.009; train − held-out −0.057 and −0.039, both significant): the reverse
+  of reward hacking. Under Haiku, step 50's held-out half instead falls (−0.046).
+  Two checkpoints agreeing makes noise less likely; the split itself (which positive
+  criteria land in which half) is the first thing to look at.
 
 ### 7.2 Is C better, or just longer?
 
@@ -532,10 +748,15 @@ Three detectors, each comparing gains between a trained and a base model:
 Plus length: median reply length, and in v2 turns and end reasons (a policy can
 learn to end consultations early, or to exhaust the patient).
 
-**What they showed (v1, §7.1).** Detector 1 found nothing: for A and C the gain on
-held-out criteria equals the gain on trained ones. Detector 2 found the gain smaller
+**What they showed (v1, §7.1).** Detector 1 found nothing: for A, C, D and E the gain
+on held-out criteria equals the gain on trained ones. Detector 2 found the gain smaller
 under Sonnet (C: +0.058 with K = 2, vs +0.087 under Haiku), still significant, and
-not explained by length.
+not explained by length. For E, trained against gpt-oss-120b, Haiku is the held-out
+judge, and it fired: +0.086 in-run under gpt-oss, −0.013 on the test set under Haiku.
+Grading every checkpoint with both judges measured the effect directly: each judge
+credits the policy trained on it by about 0.03 more than the other judge does (C and E,
+§7.1). Detector 1 cannot catch this, because a judge's preferences apply to every
+criterion, trained or held out; only a second judge can.
 Detector 3 needs patient-mode training, not run yet.
 
 ## 9. Generalizing to other tasks
@@ -569,6 +790,12 @@ Detector 3 needs patient-mode training, not run yet.
     trainer in and out of GPU memory;
   - the 35B-A3B LoRA path (`docs/megatron-lora/README.md`).
 - Next, for the judge:
+  - explain E's held-out-half gain under gpt-oss (§7.1): which criteria drive it, and
+    whether the two halves differ in what gpt-oss grades leniently;
+  - the self-hosted judge with C's recipe (std-normalization on), which separates
+    the judge from the recipe: E tied D, so the recipe is most of E's shortfall;
+  - physician-style labels for a sample of the reward's own criteria on policy
+    replies: the open judges and Haiku disagree on a third of them (§4.2);
   - check `gepa-v1` on the reward's own criteria (the Qwen regrade, negatives
     separately);
   - port it to the trajectory prompt for v2 and rerun the rewrite-fidelity check;
