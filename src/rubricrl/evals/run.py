@@ -20,6 +20,13 @@ first); `compare` pairs conversations.
     python -m rubricrl.evals.run score runs/samples/qwen3.5-4b.jsonl  # default judges
     python -m rubricrl.evals.run table runs/evals/qwen3.5-4b runs/evals/rft-60
     python -m rubricrl.evals.run compare runs/evals/qwen3.5-4b runs/evals/rft-60
+
+A self-hosted judge (SGLang, `--base-url`) is a judge like any other; `merge` then
+adds its verdicts to the Claude ones, so `compare` pairs the two judges' gains:
+
+    python -m rubricrl.evals.run score runs/samples/rft-60.jsonl \\
+        --judge gpt-oss-120b@gepa-v1 --base-url http://127.0.0.1:8004 --name rft-60-oss
+    python -m rubricrl.evals.run merge runs/evals/rft-60 runs/evals/rft-60-oss
 """
 
 import asyncio
@@ -36,7 +43,7 @@ import numpy as np
 
 from rubricrl.data import healthbench
 from rubricrl.data.schema import Example
-from rubricrl.judge.client import PRICES, ClaudeJudge, JudgeConfig, VerdictCache
+from rubricrl.judge.client import PRICES, JudgeConfig, VerdictCache, make_judge
 from rubricrl.judge.prompt import render
 from rubricrl.rewards.miles_rm import clean_response
 from rubricrl.rewards.rubric import axis_scores, clipped_mean, score
@@ -183,8 +190,10 @@ async def score_file(
     estimate: bool = False,
     root: Path = healthbench.RAW,
     out: Path = OUT,
+    base_url: str | None = None,
 ) -> Path:
-    """Grade every response in `samples_path`; write records and a summary."""
+    """Grade every response in `samples_path`; write records and a summary.
+    `base_url`: the judges are served there (self-hosted), not by the API."""
     examples = {e.id: e for e in healthbench.load_examples(root=root)}
     samples = load_samples(samples_path, max_samples)
     print(
@@ -208,10 +217,10 @@ async def score_file(
     for spec in judges:
         model, version, k = parse_judge(spec)
         judge_name = spec.partition(":")[0]  # "haiku@gepa-v1", "sonnet"
-        config = JudgeConfig.named(model, concurrency=concurrency)
+        config = JudgeConfig.named(model, concurrency=concurrency, base_url=base_url)
         if version:
             config = replace(config, prompt_version=version)
-        judge = ClaudeJudge(config, verdicts)
+        judge = make_judge(config, verdicts)
         pairs = zip(records, samples, strict=True)
         mine = [(r, s) for r, s in pairs if k is None or s["sample"] < k]
         print(f"judge {config.model}: {len(mine)} responses")
@@ -224,15 +233,35 @@ async def score_file(
             "cost_usd": round(judge.usage.cost(config.model), 3)
         }
     run_dir = out / (name or samples_path.stem)
+    write_run(run_dir, records, examples, usage, samples_path)
+    return run_dir
+
+
+def write_run(
+    run_dir: Path, records: list[dict], examples: dict, usage: dict, samples: Path
+) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     with (run_dir / "records.jsonl").open("w") as f:
         for r in records:
             f.write(json.dumps(r) + "\n")
-    summary = summarize(records, examples, usage) | {"samples": str(samples_path)}
+    summary = summarize(records, examples, usage) | {"samples": str(samples)}
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=1))
     print(table([run_dir]), end="")
     print(f"wrote {run_dir}")
-    return run_dir
+
+
+def merge(into: Path, other: Path, root: Path = healthbench.RAW) -> None:
+    """Add `other`'s judges to `into` (the same samples, graded by other judges),
+    so that `compare` pairs the judges' gains."""
+    examples = {e.id: e for e in healthbench.load_examples(root=root)}
+    a, b = _records(into), _records(other)
+    by_key = {(r["prompt_id"], r["sample"]): r for r in b}
+    if set(by_key) != {(r["prompt_id"], r["sample"]) for r in a}:
+        raise ValueError(f"{into} and {other} hold different samples")
+    for r in a:
+        r["judges"] |= by_key[(r["prompt_id"], r["sample"])]["judges"]
+    sa, sb = (json.loads((d / "summary.json").read_text()) for d in (into, other))
+    write_run(into, a, examples, sa["usage"] | sb["usage"], Path(sa["samples"]))
 
 
 # --- Tables and paired comparison ----------------------------------------------
@@ -367,6 +396,7 @@ def main() -> None:
 @click.option("--estimate", is_flag=True, help="print the cost estimate only")
 @_root
 @click.option("--out", type=click.Path(path_type=Path), default=OUT, show_default=True)
+@click.option("--base-url", default=None, help="a self-hosted judge's server (SGLang)")
 def score_cmd(**kwargs) -> None:
     asyncio.run(score_file(**kwargs))
 
@@ -375,6 +405,14 @@ def score_cmd(**kwargs) -> None:
 @click.argument("dirs", type=_dir, nargs=-1, required=True)
 def table_cmd(dirs: tuple[Path, ...]) -> None:
     print(table(list(dirs)), end="")
+
+
+@main.command("merge", help="Add OTHER's judges to INTO (the same samples).")
+@click.argument("into", type=_dir)
+@click.argument("other", type=_dir)
+@_root
+def merge_cmd(into: Path, other: Path, root: Path) -> None:
+    merge(into, other, root)
 
 
 @main.command("compare")

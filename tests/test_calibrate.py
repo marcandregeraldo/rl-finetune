@@ -94,7 +94,7 @@ def test_cache_coverage(tmp_path):
 def _run(tmp_path, monkeypatch, js, **kw):
     monkeypatch.setattr(cal.healthbench, "load_judgments", lambda root: js)
     monkeypatch.setattr(
-        cal, "ClaudeJudge", lambda config, cache: FakeJudge(lambda p: True)
+        cal, "make_judge", lambda config, cache: FakeJudge(lambda p: True)
     )
     return asyncio.run(
         cal.run(
@@ -144,3 +144,14 @@ def test_run_traces_every_call_and_logs_a_summary(tmp_path, monkeypatch):
     assert {r for _, r, _ in traced} == {0, 1}
     assert traced[0][2] == "claude-haiku-5-5-low"
     assert result["judge_rate_met"] == 1.0
+
+
+def test_self_hosted_run_reports_throughput_and_gpu_cost(tmp_path, monkeypatch):
+    js = [_j(i, (True, False)) for i in range(1, 5)]
+    serving = {"engine": "sglang", "gpus": 2, "usd_per_gpu_hour": 3.6}
+    result = _run(tmp_path, monkeypatch, js, serving=serving, constrained=False)
+    t = result["throughput"]
+    assert t["first_pass_s"] <= t["wall_s"] and t["verdicts_per_s"] > 0
+    assert t["gpu_usd"] == pytest.approx(2 * t["wall_s"] * 3.6 / 3600, abs=1e-3)
+    assert result["serving"] == serving | {"constrained": False}
+    assert "gpu_usd" not in _run(tmp_path, monkeypatch, js)["throughput"]

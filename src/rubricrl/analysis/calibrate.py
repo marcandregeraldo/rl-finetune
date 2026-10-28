@@ -39,11 +39,11 @@ from rubricrl.data import healthbench
 from rubricrl.data.schema import Judgment
 from rubricrl.judge.client import (
     PRICES,
-    ClaudeJudge,
     JudgeConfig,
     Verdict,
     VerdictCache,
     cache_key,
+    make_judge,
 )
 from rubricrl.judge.prompt import (
     PROMPT_VERSION,
@@ -286,6 +286,26 @@ def cache_coverage(
     return sum(cache.get(k) is not None for k in keys), len(keys)
 
 
+def throughput(
+    usage, n: int, first_pass_s: float, wall_s: float, serving: dict | None = None
+) -> dict:
+    """How fast the judge graded: the first pass (`n` verdicts, no retest) is the
+    rate that matters for a training step. Self-hosted (`serving`): what the GPUs
+    cost over the whole run, retest included."""
+    out = {
+        "first_pass_s": round(first_pass_s, 1),
+        "wall_s": round(wall_s, 1),
+        "verdicts_per_s": round(n / first_pass_s, 2) if first_pass_s else None,
+        "output_tokens_per_verdict": round(usage.output_tokens / usage.calls, 1)
+        if usage.calls
+        else None,
+    }
+    if serving:
+        gpu_h = serving["gpus"] * wall_s / 3600
+        out["gpu_usd"] = round(gpu_h * serving["usd_per_gpu_hour"], 3)
+    return out
+
+
 def label(
     config: JudgeConfig, grader: str = "response", prompt_version: str | None = None
 ) -> str:
@@ -295,6 +315,7 @@ def label(
         + ("-thinking" if config.thinking else "")
         + ("-trajectory" if grader == "trajectory" else "")
         + (f"-{prompt_version}" if prompt_version else "")
+        + ("" if config.constrained else "-unconstrained")
     )
 
 
@@ -315,6 +336,9 @@ async def run(
     grader: str = "response",
     template: Path | None = None,
     prompt_version: str | None = None,
+    base_url: str | None = None,
+    constrained: bool = True,
+    serving: dict | None = None,
 ) -> dict:
     """Grade `n` judgments (and the first `retest` again); write the result JSON.
 
@@ -325,6 +349,10 @@ async def run(
     `template`: a response template file instead of simple-evals' (an optimized
     one, `judge/optimize.py`), named `prompt_version` (default: the file's stem).
     `prompt_version` alone: a built-in template (`judge.prompt.TEMPLATES`).
+    `base_url`: a self-hosted judge's OpenAI-compatible server (`judge_name` is
+    then its served model name; `judge.client.OpenAICompatJudge`), `constrained`
+    whether its replies are forced to the verdict schema, and `serving` how it
+    is served (engine, gpus, gpu_type, usd_per_gpu_hour): the GPU cost.
     """
     if (template is not None or prompt_version) and grader == "trajectory":
         raise ValueError("--template / --prompt-version: response grader only")
@@ -343,7 +371,12 @@ async def run(
     all_judgments = healthbench.load_judgments(root)
     subset = sample_judgments(all_judgments, n, seed)
     config = JudgeConfig.named(
-        judge_name, effort=effort, thinking=thinking, concurrency=concurrency
+        judge_name,
+        effort=effort,
+        thinking=thinking,
+        concurrency=concurrency,
+        base_url=base_url,
+        constrained=constrained,
     )
     name = label(config, grader, prompt_version)
     verdict_cache = VerdictCache(cache) if cache else VerdictCache()
@@ -351,7 +384,7 @@ async def run(
     print(f"{name}: {hits}/{needed} verdicts cached")
     if require_cached and hits < needed:
         raise SystemExit(f"{needed - hits} verdicts not cached (--require-cached)")
-    judge = ClaudeJudge(config, verdict_cache)
+    judge = make_judge(config, verdict_cache)
     if grader == "trajectory":
         judge = TrajectoryGrading(judge)
     elif text is not None:
@@ -372,11 +405,14 @@ async def run(
     print(
         f"{config.model}: grading {len(subset)} judgments (estimate {estimate(subset)})"
     )
+    t0 = time.monotonic()
     verdicts = await grade_all(judge, subset, grade=grade)
+    first_pass_s = time.monotonic() - t0
     labels = [v.met for v in verdicts]
     retest_items = subset[:retest]
     print(f"{config.model}: regrading {len(retest_items)} for test-retest")
     retest_verdicts = await grade_all(judge, retest_items, repeat=1, grade=grade)
+    wall_s = time.monotonic() - t0
     both = [
         (a, b.met)
         for a, b in zip(labels, retest_verdicts, strict=False)
@@ -410,8 +446,13 @@ async def run(
         ),
         "usage": vars(judge.usage)
         | {"cost_usd": round(judge.usage.cost(config.model), 3)},
+        "throughput": throughput(
+            judge.usage, len(subset), first_pass_s, wall_s, serving
+        ),
         "labels": {j.id: x for j, x in zip(subset, labels, strict=True)},
     }
+    if serving:
+        result["serving"] = serving | {"constrained": constrained}
     if weave_project:
         result["weave_url"] = observe.log_calibration_summary(
             result, attributes, dataset
@@ -424,6 +465,8 @@ async def run(
             "judge": judge_name, "model": config.model, "effort": config.effort,
             "thinking": config.thinking, "grader": grader,
             "prompt_version": version, "template": str(template or ""),
+            "self_hosted": bool(base_url),
+            **({"constrained": constrained} | serving if serving else {}),
             "n": len(subset), "seed": seed, "retest": retest,
         }  # fmt: skip
         result["wandb_url"] = observe.log_wandb_calibration(
@@ -556,6 +599,23 @@ def estimate_cmd(n: int, seed: int, root: Path) -> None:
     "--prompt-version",
     default=None,
     help="a built-in template (e.g. gepa-v1), or --template's name (default: stem)",
+)
+@click.option(
+    "--base-url",
+    default=None,
+    help="a self-hosted judge's OpenAI-compatible server (--judge: its model name)",
+)
+@click.option(
+    "--constrained/--unconstrained",
+    default=True,
+    show_default=True,
+    help="self-hosted: force replies to the verdict schema, or parse their JSON",
+)
+@click.option(
+    "--serving",
+    default=None,
+    callback=lambda ctx, param, value: json.loads(value) if value else None,
+    help='self-hosted: JSON, e.g. {"gpus": 1, "usd_per_gpu_hour": 3.95} (GPU cost)',
 )
 def run_cmd(**kwargs) -> None:
     asyncio.run(run(**kwargs))

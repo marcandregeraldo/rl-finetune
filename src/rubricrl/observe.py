@@ -287,6 +287,8 @@ def calibration_summary(result: dict) -> dict:
         },
         "failed": result["failed"],
         "cost_usd_new_calls": result["usage"]["cost_usd"],
+        # how fast it graded (older results have none); self-hosted: GPU $
+        **{f"throughput_{k}": v for k, v in result.get("throughput", {}).items()},
     }
 
 
@@ -541,6 +543,7 @@ def log_wandb_calibration(project: str, result: dict, config: dict) -> str | Non
         group=config.get("prompt_version", PROMPT_VERSION),
         name=f"{result['label']}-n{result['n']}",
         config=config | _git(),
+        tags=["self-hosted"] if config.get("self_hosted") else None,
         reinit="finish_previous",
     )
     run.summary.update(

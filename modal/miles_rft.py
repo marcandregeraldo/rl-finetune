@@ -22,16 +22,18 @@ path needs only `anthropic`, pinned below, and numpy, already there).
 Once: Modal secrets `anthropic` (ANTHROPIC_API_KEY), `wandb` (WANDB_API_KEY),
 `huggingface-secret` (HF_TOKEN). Then (prefix with `uv run`):
 
-    modal run modal/miles_rft.py --task math --smoke-test      # pipeline, no judge
-    modal run modal/miles_rft.py --smoke-test                  # 2 steps, real judge
-    modal run --detach modal/miles_rft.py --num-rollout 60     # the run
-    modal run modal/miles_rft.py::export --run-id RUN_ID       # -> HF weights
-    modal run modal/miles_rft.py::sync_traces --run-id RUN_ID  # judge log -> Weave
-    modal run modal/miles_rft.py --smoke-test --reward env     # vs the OpenEnv env
-    modal run modal/miles_rft.py --smoke-test --reward env --env-mode patient
-    modal run --detach modal/miles_rft.py --reward env --no-dashboard
-    modal run modal/miles_rft.py::ray_check --hold-s 600         # try the login (CPU)
-    modal run modal/miles_rft.py::log_check                      # W&B keys (CPU)
+    modal run modal/miles_rft.py::main --task math --smoke-test   # pipeline, no judge
+    modal run modal/miles_rft.py::main --smoke-test               # 2 steps, real judge
+    modal run --detach modal/miles_rft.py::main --num-rollout 60  # the run
+    modal run modal/miles_rft.py::export --run-id RUN_ID          # -> HF weights
+    modal run modal/miles_rft.py::sync_traces --run-id RUN_ID     # judge log -> Weave
+    modal run modal/miles_rft.py::main --smoke-test --reward env  # vs the OpenEnv env
+    modal run modal/miles_rft.py::main --smoke-test --reward env --env-mode patient
+    modal run --detach modal/miles_rft.py::main --reward env --no-dashboard
+    modal run modal/miles_rft.py::ray_check --hold-s 600          # try the login (CPU)
+    modal run modal/miles_rft.py::log_check                       # W&B keys (CPU)
+
+`::main` is needed: the file has two local entrypoints (`calibrate_judge` too).
 
 **Watching a run.** W&B (project rl-finetune, one run named RUN_ID, tagged with
 the reward path and judge): Miles' `train/*` (loss, pg_loss, grad_norm, lr-pg_0,
@@ -111,6 +113,29 @@ MODELS = {
     "qwen3.5-4b": ("Qwen/Qwen3.5-4B", "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"),
     "qwen3-4b": ("Qwen/Qwen3-4B", "1cfa9a7208912126459214e8b04321603b3df60c"),
 }
+# Self-hosted judges (`calibrate_judge`, `--judge-model`): name -> (HF repo,
+# revision, GPUs), served by the image's SGLang from DATA/models/<name>.
+JUDGE_MODELS = {
+    # 2: on one H100 the image's SGLang runs out of memory loading it (70 GB)
+    "gpt-oss-120b": (
+        "openai/gpt-oss-120b",
+        "b5c939de8f754692c1647ca79fbf85e8c1e70f8a",
+        2,
+    ),
+    "gpt-oss-20b": (
+        "openai/gpt-oss-20b",
+        "6cee5e81ee83917806bbde320786a8fb61efebee",
+        1,
+    ),
+    "qwen3.6-35b-a3b": (
+        "Qwen/Qwen3.6-35B-A3B",
+        "995ad96eacd98c81ed38be0c5b274b04031597b0",
+        2,
+    ),
+    "qwen3.5-4b": (*MODELS["qwen3.5-4b"], 1),
+}
+JUDGE_PORT = 8004  # next to the env server's; Miles' engines pick their own
+JUDGE = Path("/judge")  # Volume rubricrl-judge: raw/ (the meta-eval), calibration/
 DATASETS = {
     "dapo-math-17k": (
         "zhuzilin/dapo-math-17k",
@@ -123,6 +148,7 @@ BOXED = "\n\nPlease reason step by step, and put your final answer within \\boxe
 
 data_volume = modal.Volume.from_name("rubricrl-data", create_if_missing=True)
 runs_volume = modal.Volume.from_name("rubricrl-runs", create_if_missing=True, version=2)
+judge_volume = modal.Volume.from_name("rubricrl-judge", create_if_missing=True)
 
 download_image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -144,7 +170,7 @@ def download(models: list[str], datasets: list[str] = ()) -> None:
     from huggingface_hub import snapshot_download
 
     for name in models:
-        repo, rev = MODELS[name]
+        repo, rev = MODELS[name] if name in MODELS else JUDGE_MODELS[name][:2]
         snapshot_download(repo, revision=rev, local_dir=DATA / "models" / name)
     for name in datasets:
         repo, rev = DATASETS[name]
@@ -425,7 +451,11 @@ def train(
     gpus: int = N_GPUS,
     prompts_per_step: int = 16,
     judge_concurrency: int = JUDGE_CONCURRENCY,
+    judge_gpus: int = 0,
 ) -> str:
+    """`judge_gpus` > 0: `judge` is a self-hosted model (JUDGE_MODELS), served by
+    SGLang on the container's last `judge_gpus` GPUs; Miles gets the first
+    `gpus`."""
     ip = socket.gethostbyname(socket.gethostname())
     run_dir = RUNS / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -446,10 +476,13 @@ def train(
         "WANDB_TAGS": tags,
         # for the running cost in W&B (rubricrl.rewards.miles_log)
         "RUBRICRL_RUN_START": str(time.time()),
-        "RUBRICRL_GPUS": str(gpus),
+        "RUBRICRL_GPUS": str(gpus + judge_gpus),
         "RUBRICRL_CONCURRENCY": str(judge_concurrency),
         "RUBRICRL_GPU_USD_PER_HOUR": str(GPU_USD_PER_HOUR),
     }
+    if judge_gpus:
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, range(gpus)))  # Ray, Miles
+        env["RUBRICRL_JUDGE_URL"] = f"http://127.0.0.1:{JUDGE_PORT}"
     args = training_args(
         task, model, run_dir, num_rollout, smoke_test, reward, env_mode,
         lr=lr, dynamic_sampling=dynamic_sampling, save_interval=save_interval,
@@ -458,6 +491,13 @@ def train(
     )  # fmt: skip
     (run_dir / "args.txt").write_text(shlex.join(args) + "\n")
     data_volume.reload()
+    judge_server = (
+        start_judge_server(
+            judge, list(range(gpus, gpus + judge_gpus)), run_dir / "judge_server.log"
+        )
+        if judge_gpus
+        else None
+    )
     sidecar = start_env_server(env, run_dir) if reward == "env" else None
     stack = contextlib.ExitStack()  # tunnels, Prometheus, Grafana
     stop = threading.Event()
@@ -490,6 +530,8 @@ def train(
         stack.close()
         if sidecar is not None:
             sidecar.terminate()
+        if judge_server is not None:
+            judge_server.terminate()
         if cache.exists():
             shutil.copy(cache, run_dir / "judge.sqlite")
         runs_volume.commit()
@@ -640,6 +682,49 @@ def start_env_server(env: dict, run_dir: Path) -> subprocess.Popen:
     raise RuntimeError("env server did not start in 120 s")
 
 
+def start_judge_server(
+    model: str, gpus: list[int], log_path: Path, timeout_s: int = 30 * MINUTES
+) -> subprocess.Popen:
+    """A self-hosted judge: SGLang's OpenAI-compatible server for `model` on
+    `gpus` (device indices), on localhost:JUDGE_PORT (`judge.client.
+    OpenAICompatJudge`): tensor-parallel over the GPUs the model needs
+    (JUDGE_MODELS), data-parallel over any more. gpt-oss: its reasoning goes to a
+    separate field, so the reply holds only the verdict."""
+    tp = JUDGE_MODELS[model][2]
+    if len(gpus) % tp:
+        raise ValueError(f"{model}: a multiple of {tp} GPUs")
+    flags = ["--reasoning-parser", "gpt-oss"] if model.startswith("gpt-oss") else []
+    log = log_path.open("w")
+    proc = subprocess.Popen(
+        [
+            "python", "-m", "sglang.launch_server",
+            "--model-path", str(DATA / "models" / model), "--served-model-name", model,
+            "--tp", str(tp), "--dp-size", str(len(gpus) // tp),
+            "--host", "127.0.0.1", "--port", str(JUDGE_PORT),
+            "--mem-fraction-static", "0.85", "--context-length", "16384", *flags,
+        ],
+        env={**os.environ, "CUDA_VISIBLE_DEVICES": ",".join(map(str, gpus))},
+        stdout=log, stderr=subprocess.STDOUT,
+    )  # fmt: skip
+    import urllib.request
+
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout_s:
+        if proc.poll() is not None:
+            raise RuntimeError(f"judge server exited:\n{log_path.read_text()[-3000:]}")
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{JUDGE_PORT}/health", timeout=5
+            ):
+                up = time.monotonic() - t0
+                print(f"judge {model} up on :{JUDGE_PORT} in {up:.0f}s", flush=True)
+                return proc
+        except OSError:
+            time.sleep(5)
+    proc.terminate()
+    raise RuntimeError(f"judge server not up in {timeout_s} s; see {log_path}")
+
+
 @app.local_entrypoint()
 def main(
     task: str = "healthbench",
@@ -661,6 +746,8 @@ def main(
     gpus: int = N_GPUS,
     prompts_per_step: int = 16,
     judge_concurrency: int = JUDGE_CONCURRENCY,
+    judge_model: str = "",
+    judge_gpus: int = 1,
 ):
     """--task healthbench|math, --model qwen3.5-4b|qwen3-4b, --judge haiku|sonnet,
     --reward rm|env (env: episodes against rubricrl.env), --env-mode single|patient,
@@ -671,7 +758,9 @@ def main(
     --save-interval (checkpoint every N steps, default 5),
     --no-std-normalization (Dr. GRPO advantages: reward - group mean only),
     --gpus 2|4 (H100s, default 4), --prompts-per-step (default 16, x 8 replies),
-    --judge-concurrency (judge requests in flight, default 256)."""
+    --judge-concurrency (judge requests in flight, default 256),
+    --judge-model gpt-oss-120b|... (a self-hosted judge, JUDGE_MODELS, instead of
+    --judge; on --judge-gpus more H100s, default 1, next to the --gpus)."""
     if task not in ("healthbench", "math") or model not in MODELS:
         raise SystemExit(f"--task healthbench|math, --model one of {sorted(MODELS)}")
     if reward not in ("rm", "env") or env_mode not in ("single", "patient"):
@@ -693,6 +782,16 @@ def main(
         raise SystemExit(f"data/miles/{prefix}_train.jsonl missing: run `{hint}`")
     if gpus not in (1, 2, 4, 8):
         raise SystemExit("--gpus 1|2|4|8")
+    if judge_model and judge_model not in JUDGE_MODELS:
+        raise SystemExit(f"--judge-model one of {sorted(JUDGE_MODELS)}")
+    if judge_model and (task != "healthbench" or env_mode != "single"):
+        raise SystemExit("--judge-model: healthbench, single mode (no patient model)")
+    if judge_model:
+        judge, judge_gpus = judge_model, max(judge_gpus, JUDGE_MODELS[judge_model][2])
+        if judge_gpus % JUDGE_MODELS[judge_model][2]:
+            raise SystemExit(f"--judge-gpus: a multiple of {JUDGE_MODELS[judge][2]}")
+    else:
+        judge_gpus = 0
     if smoke_test:
         num_rollout = 2
     run_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{task}-{uuid.uuid4().hex[:6]}"
@@ -701,15 +800,24 @@ def main(
     if task == "healthbench":
         thinking = "-thinking" if judge_thinking else ""
         tags += [f"judge:{judge}-{judge_effort}{thinking}", f"prompt:{judge_prompt}"]
+        tags += [f"self-hosted-judge:{judge_gpus}gpu"] if judge_gpus else []
         tags += [f"mode:{env_mode}"] if reward == "env" else []
     tags += [f"lr:{lr:g}"] + (["dynamic-sampling"] if dynamic_sampling else [])
     tags += [] if std_normalization else ["no-std-norm"]
     tags += [f"gpus:{gpus}", f"prompts:{prompts_per_step}"]
     tags += ["smoke"] if smoke_test else []
-    download.remote([model], ["dapo-math-17k", "aime-2024"] if task == "math" else [])
+    download.remote(
+        [model, *([judge] if judge_gpus else [])],
+        ["dapo-math-17k", "aime-2024"] if task == "math" else [],
+    )
     # The GPU count is part of the function's resources: set it per run.
     result = (
-        train.with_options(gpu=f"{GPU}:{gpus}")
+        train.with_options(
+            # a judge's SGLang schedulers need CPUs of their own next to Miles'
+            gpu=f"{GPU}:{gpus + judge_gpus}",
+            cpu=16 + 4 * judge_gpus,
+            memory=(128 + 32 * judge_gpus) * 1024,
+        )
         .spawn(
             run_id,
             task,
@@ -732,6 +840,7 @@ def main(
             gpus=gpus,
             prompts_per_step=prompts_per_step,
             judge_concurrency=judge_concurrency,
+            judge_gpus=judge_gpus,
         )
         .get()
     )
@@ -1274,3 +1383,292 @@ def log_check(
             print(f"  {k} = {v}")
     print(json.dumps({k: v for k, v in result.items() if k != "logged"}), flush=True)
     return result
+
+
+# --- Self-hosted judge calibration ---------------------------------------------
+
+
+@app.function(
+    image=image,
+    gpu=GPU,
+    cpu=8,
+    memory=64 * 1024,
+    volumes={DATA: data_volume, JUDGE: judge_volume, RUNS: runs_volume},
+    secrets=[modal.Secret.from_name("wandb")],  # no API judge: no anthropic key
+    timeout=4 * 60 * MINUTES,
+)
+def judge_calibration(
+    model: str, runs: list[dict], git: dict, gpus: int = 0
+) -> list[dict]:
+    """`rubricrl.analysis.calibrate run` against a self-hosted judge: the model on
+    this container's GPUs (SGLang), the calibration in the env venv (it has
+    weave/wandb), logged to W&B and Weave like the Haiku runs (project
+    rl-finetune). The verdict cache is per model and decoding mode, copied to
+    local disk (SQLite's WAL isn't safe on a network filesystem) and back.
+
+    A run with `bench`: one training step's worth of verdicts, timed alone (an
+    empty cache, no Weave or W&B in the loop, not saved to the Volume). With
+    `replay` (a run id): that run's first step re-graded (`analysis.replay`). With
+    `evals` (sample-file names in /judge/evals/samples): each graded on the test set
+    like `rubricrl.evals.run score`, records and summary returned."""
+    gpus = gpus or JUDGE_MODELS[model][2]
+    work = Path("/tmp/calibration")
+    work.mkdir(parents=True, exist_ok=True)
+    data_volume.reload()
+    server = start_judge_server(model, list(range(gpus)), work / "judge_server.log")
+    results = []
+    try:
+        probe_reasoning(model, runs[0]["effort"])
+        for opts in runs:
+            if names := opts.get("evals"):
+                stored = JUDGE / "self-hosted" / f"{model}-evals.sqlite"
+                cache = work / stored.name
+                if stored.exists() and not cache.exists():
+                    shutil.copy(stored, cache)
+                version = opts["prompt_version"]
+                for name in names:
+                    run_name = f"{name}-{model}"
+                    subprocess.run(
+                        [f"{ENV_VENV}/bin/python", "-m", "rubricrl.evals.run", "score",
+                         str(JUDGE / "evals" / "samples" / f"{name}.jsonl"),
+                         "--judge", f"{model}@{version}" if version else model,
+                         "--base-url", f"http://127.0.0.1:{JUDGE_PORT}",
+                         "--concurrency", str(opts["concurrency"]),
+                         "--cache", str(cache), "--root", str(JUDGE / "raw"),
+                         "--out", str(work / "evals"), "--name", run_name],
+                        env={**os.environ, "PYTHONPATH": "/root"}, check=True,
+                    )  # fmt: skip
+                    d = work / "evals" / run_name
+                    results.append({
+                        "evals": run_name,
+                        "records": (d / "records.jsonl").read_text(),
+                        "summary": (d / "summary.json").read_text(),
+                    })  # fmt: skip
+                    stored.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy(cache, stored)
+                    judge_volume.commit()
+                continue
+            if run_id := opts.get("replay"):
+                path = work / f"replay-{run_id}.json"
+                subprocess.run(
+                    [f"{ENV_VENV}/bin/python", "-m", "rubricrl.analysis.replay",
+                     str(RUNS / run_id / "rewards.jsonl"),
+                     "--data", str(HB / "healthbench_train.jsonl"), "--judge", model,
+                     "--base-url", f"http://127.0.0.1:{JUDGE_PORT}",
+                     "--effort", opts["effort"],
+                     "--concurrency", str(opts["concurrency"]),
+                     "--verdicts", str(STEP_VERDICTS), "--out", str(path)],
+                    env={**os.environ, "PYTHONPATH": "/root"}, check=True,
+                )  # fmt: skip
+                results.append(json.loads(path.read_text()) | {"replay": run_id})
+                continue
+            mode = "constrained" if opts.get("constrained", True) else "free"
+            bench = opts.get("bench", False)
+            stored = JUDGE / "self-hosted" / f"{model}-{mode}.sqlite"
+            cache = work / ("bench.sqlite" if bench else stored.name)
+            if bench:
+                cache.unlink(missing_ok=True)
+            elif stored.exists() and not cache.exists():
+                shutil.copy(stored, cache)
+            serving = {
+                "engine": "sglang", "gpus": gpus, "gpu_type": "H100",
+                "tp": JUDGE_MODELS[model][2], "dp": gpus // JUDGE_MODELS[model][2],
+                "usd_per_gpu_hour": GPU_USD_PER_HOUR,
+                "reasoning_effort": opts["effort"] if "gpt-oss" in model else None,
+            }  # fmt: skip
+            out = work / ("bench" if bench else "out")
+            cmd = [
+                f"{ENV_VENV}/bin/python", "-m", "rubricrl.analysis.calibrate", "run",
+                "--judge", model, "--base-url", f"http://127.0.0.1:{JUDGE_PORT}",
+                "--n", str(opts["n"]), "--retest", str(opts["retest"]),
+                "--effort", opts["effort"], "--concurrency", str(opts["concurrency"]),
+                "--root", str(JUDGE / "raw"), "--out", str(out), "--cache", str(cache),
+                "--serving", json.dumps(serving),
+                "--constrained" if mode == "constrained" else "--unconstrained",
+            ]  # fmt: skip
+            if opts.get("prompt_version"):
+                cmd += ["--prompt-version", opts["prompt_version"]]
+            if not bench:
+                cmd += ["--weave", "rl-finetune", "--wandb", "rl-finetune"]
+            env = {**os.environ, **git, "PYTHONPATH": "/root"}  # rubricrl, no Miles
+            subprocess.run(cmd, env=env, check=True)
+            path = max(out.glob("*.json"), key=lambda p: p.stat().st_mtime)  # newest
+            results.append(json.loads(path.read_text()) | {"bench": bench})
+            if bench:
+                continue
+            stored.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(cache, stored)
+            (JUDGE / "calibration").mkdir(exist_ok=True)
+            shutil.copy(path, JUDGE / "calibration" / path.name)
+            judge_volume.commit()
+    finally:
+        server.terminate()
+        print((work / "judge_server.log").read_text()[-2000:], flush=True)
+    return results
+
+
+PROBE_SCRIPT = """
+import json, sys, httpx
+from rubricrl.judge.prompt import VERDICT_SCHEMA
+model, effort = sys.argv[1], sys.argv[2]
+payload = {
+    "model": model, "max_tokens": 1024, "temperature": 0,
+    "messages": [{"role": "user", "content": "Is 7 a prime number? Reply in JSON: "
+                  '{"explanation": "...", "criteria_met": true or false}'}],
+    "response_format": {"type": "json_schema",
+                        "json_schema": {"name": "verdict", "schema": VERDICT_SCHEMA}},
+}
+if model.startswith("gpt-oss"):
+    payload["reasoning_effort"] = effort
+else:
+    payload["chat_template_kwargs"] = {"enable_thinking": False}
+r = httpx.post(f"{sys.argv[3]}/v1/chat/completions", json=payload, timeout=300).json()
+m = r["choices"][0]["message"]
+print("probe:", json.dumps({"reasoning_chars": len(m.get("reasoning_content") or ""),
+      "content": m.get("content"), "usage": r.get("usage")}))
+"""
+
+
+def probe_reasoning(model: str, effort: str) -> None:
+    """One forced-JSON request, to show in the log whether the model still
+    reasons under the schema (gpt-oss: `reasoning_content`) and what it returns."""
+    subprocess.run(
+        [f"{ENV_VENV}/bin/python", "-c", PROBE_SCRIPT, model, effort,
+         f"http://127.0.0.1:{JUDGE_PORT}"],
+        env={**os.environ, "PYTHONPATH": "/root"}, check=False,
+    )  # fmt: skip
+
+
+# Grading one training step: 16 prompts x 8 replies x ~13 training criteria.
+STEP_VERDICTS = 1700
+
+
+@app.local_entrypoint()
+def calibrate_judge(
+    model: str = "gpt-oss-120b",
+    n: int = 1000,
+    retest: int = 200,
+    prompts: str = "simple-evals-healthbench-v1,gepa-v1",
+    effort: str = "low",
+    concurrency: int = JUDGE_CONCURRENCY,
+    constrained: bool = True,
+    step_bench: bool = False,
+    gpus: int = 0,
+    replay: str = "",
+    evals: str = "",
+):
+    """Calibrate a self-hosted judge against physicians, once per prompt in
+    `--prompts`, on the same 1,000 meta-eval judgments as the Haiku runs.
+    Writes analysis/out/calibration/<label>-n<n>.json and prints the gate:
+    balanced F1, "met" on the longest quartile, seconds per training step.
+    `--step-bench`: instead, time one step's STEP_VERDICTS verdicts per prompt, alone
+    (to analysis/out/calibration/bench/; the calibration's own rate includes
+    Weave tracing). `--replay RUN_ID`: instead, re-grade that run's first step
+    with this judge (`rubricrl.analysis.replay`: time, agreement with the run's
+    judge). `--evals NAME,...`: instead, grade runs/samples/NAME.jsonl on the test
+    set with this judge and the first of `--prompts` (to runs/evals/NAME-MODEL;
+    `rubricrl.evals.run merge` then pairs it with the Claude grades). `--gpus`:
+    more than the model needs, as data parallelism.
+
+        modal run modal/miles_rft.py::calibrate_judge --model gpt-oss-120b
+        modal run modal/miles_rft.py::calibrate_judge --model gpt-oss-20b --n 20 \\
+            --retest 4 --prompts gepa-v1          # the quick check
+    """
+    if model not in JUDGE_MODELS:
+        raise SystemExit(f"--model one of {sorted(JUDGE_MODELS)}")
+    from rubricrl.judge.prompt import PROMPT_VERSION
+
+    runs = [
+        {
+            "n": n, "retest": retest, "effort": effort, "concurrency": concurrency,
+            "constrained": constrained,
+            "prompt_version": None if p == PROMPT_VERSION else p,
+        }
+        for p in prompts.split(",")
+    ]  # fmt: skip
+    if step_bench:
+        runs = [r | {"n": STEP_VERDICTS, "retest": 0, "bench": True} for r in runs]
+    if replay:
+        runs = [runs[0] | {"replay": replay}]
+    if evals:
+        names = evals.split(",")
+        runs = [runs[0] | {"evals": names}]
+        _upload_eval_inputs(names)
+    download.remote([model])
+    gpus = gpus or JUDGE_MODELS[model][2]
+    fn = judge_calibration.with_options(
+        gpu=f"{GPU}:{gpus}", cpu=8 * gpus, memory=64 * 1024 * gpus
+    )
+    out = ROOT / "analysis" / "out" / "calibration"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "bench").mkdir(exist_ok=True)
+    (out / "replay").mkdir(exist_ok=True)
+    for r in fn.remote(model, runs, _git(), gpus):
+        if r.get("evals"):
+            d = ROOT / "runs" / "evals" / r["evals"]
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "records.jsonl").write_text(r["records"])
+            (d / "summary.json").write_text(r["summary"])
+            print(f"wrote {d}")
+            continue
+        if r.get("replay"):
+            path = out / "replay" / f"{model}-{gpus}gpu-{r['replay']}.json"
+            path.write_text(json.dumps(r, indent=1))
+            print(
+                f"{model} on {gpus} GPU(s), replaying {r['replay']}: {r['verdicts']}"
+                f" verdicts in {r['wall_s']} s, failed {r['failed']}, agreement"
+                f" {r['agreement']:.3f} (kappa {r['kappa']:.2f}), met"
+                f" {r['rate_met']['replay']:.0%} vs {r['rate_met']['run']:.0%},"
+                f" score r={r['score_pearson']:.2f} -> {path}"
+            )
+            continue
+        name = f"{r['label']}-n{r['n']}" + (f"-{gpus}gpu" if r["bench"] else "")
+        path = out / ("bench" if r["bench"] else "") / f"{name}.json"
+        path.write_text(json.dumps(r, indent=1))
+        t, longest = r["throughput"], r["by_length"][-1]
+        step_s = STEP_VERDICTS / t["verdicts_per_s"] if t["verdicts_per_s"] else None
+        if r["bench"]:
+            print(
+                f"{r['label']} step bench: {r['n']} verdicts in "
+                f"{t['first_pass_s']} s, failed {r['failed']} -> {path}"
+            )
+            continue
+        f1, kappa = r["judge"]["overall"]["f1_balanced"], r["retest"]["kappa"]
+        print(
+            f"{r['label']} n={r['n']}: balanced F1 {f1:.3f}, failed {r['failed']}, "
+            f"met {r['judge_rate_met']:.0%} (longest quartile "
+            f"{longest['judge_rate_met']:.0%} vs physicians "
+            f"{longest['physician_rate_met']:.0%}), retest kappa {kappa}, "
+            f"{t['verdicts_per_s']} verdicts/s (~{step_s:.0f} s per step), "
+            f"GPU ${t['gpu_usd']} -> {path}"
+        )
+        print(f"  weave: {r.get('weave_url')}\n  wandb: {r.get('wandb_url')}")
+
+
+def _upload_eval_inputs(names: list[str]) -> None:
+    """The sample files, and HealthBench's conversations (the judge Volume has only
+    the meta-eval), for `--evals`."""
+    from rubricrl.data import healthbench
+
+    raw = healthbench.SOURCES["oss_eval"].file
+    have = {e.path for e in judge_volume.listdir("/raw")}
+    with judge_volume.batch_upload(force=True) as batch:
+        if f"raw/{raw}" not in have:
+            batch.put_file(ROOT / healthbench.RAW / raw, f"/raw/{raw}")
+        for name in names:
+            local = ROOT / "runs" / "samples" / f"{name}.jsonl"
+            batch.put_file(local, f"/evals/samples/{name}.jsonl")
+
+
+def _git() -> dict:
+    """This checkout's commit, for the W&B config (no git inside the container)."""
+
+    def out(*cmd: str) -> str:
+        return subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT).stdout
+
+    return {
+        "RUBRICRL_GIT_SHA": out("git", "rev-parse", "HEAD").strip(),
+        "RUBRICRL_GIT_DIRTY": "1"
+        if out("git", "status", "--porcelain").strip()
+        else "0",
+    }

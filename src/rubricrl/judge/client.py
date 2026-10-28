@@ -14,6 +14,9 @@
   prompt version, the full grader prompt, repeat). A rerun costs nothing.
 - **API key:** `ANTHROPIC_API_KEY`, else (macOS) the Keychain item
   `anthropic-api-key`. Never logged or written anywhere.
+- **Self-hosted judges** (`OpenAICompatJudge`, `JudgeConfig.base_url`): an open
+  model behind an OpenAI-compatible server (SGLang), same prompt, schema and cache;
+  `make_judge` picks the class from the config.
 
 Shipped into the Miles image (Python 3.12): keep the syntax 3.10-compatible.
 """
@@ -75,6 +78,13 @@ class JudgeConfig:
     concurrency: int = 32  # requests in flight
     max_attempts: int = 3  # per verdict, on refusal / truncation / API errors
     prompt_version: str = PROMPT_VERSION  # the response template (prompt.TEMPLATES)
+    # A self-hosted judge (OpenAICompatJudge): its OpenAI-compatible server, e.g.
+    # SGLang on http://127.0.0.1:30000. None: Claude through the Anthropic API.
+    base_url: str | None = None
+    temperature: float = 0.0  # self-hosted only (the Anthropic API has none)
+    # Self-hosted: constrained decoding to VERDICT_SCHEMA. False: parse the JSON out
+    # of a free reply (for servers that can't constrain a reasoning model's output).
+    constrained: bool = True
 
     def __post_init__(self):
         if self.prompt_version not in TEMPLATES:
@@ -330,6 +340,88 @@ class ClaudeJudge(_Grader):
             return Verdict(bool(d["criteria_met"]), d.get("explanation", "")), tokens
         except (json.JSONDecodeError, KeyError, TypeError) as e:
             return Verdict(None, error=f"bad output: {e}"), tokens
+
+
+class HTTPStatusError(Exception):
+    def __init__(self, status_code: int, body: str):
+        super().__init__(f"HTTP {status_code}: {body[:300]}")
+        self.status_code = status_code
+
+
+class OpenAICompatJudge(ClaudeJudge):
+    """A self-hosted judge behind an OpenAI-compatible `/v1/chat/completions`
+    (SGLang serving an open model). The same prompt, verdict schema, cache, retries
+    and accounting as `ClaudeJudge`; only the call differs:
+
+    - the schema is enforced by the server's constrained decoding
+      (`response_format: json_schema`);
+    - `temperature` 0 by default, so a verdict is deterministic (test-retest
+      measures the server's numerical noise, not sampling);
+    - thinking is off through the chat template (`enable_thinking`, Qwen), unless
+      `config.thinking`; gpt-oss always reasons, at `reasoning_effort` =
+      `config.effort` (its final channel holds the verdict);
+    - cost 0 in `Usage` (GPU time is paid elsewhere); tokens are still counted.
+
+    `config.model` is the served model name; it keys the cache, so open-model
+    verdicts never mix with Claude's.
+    """
+
+    @property
+    def client(self):
+        if self._client is None:
+            import httpx
+
+            # httpx's default pool (100 connections) would cap the requests in
+            # flight below `concurrency`
+            limits = httpx.Limits(max_connections=self.config.concurrency)
+            self._client = httpx.AsyncClient(timeout=600.0, limits=limits)
+        return self._client
+
+    async def _call(self, prompt: str) -> tuple[Verdict, tuple[int, int]]:
+        cfg = self.config
+        payload = {
+            "model": cfg.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": cfg.max_tokens,
+            "temperature": cfg.temperature,
+        }
+        if cfg.constrained:
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "verdict", "schema": VERDICT_SCHEMA},
+            }
+        if cfg.model.startswith("gpt-oss"):
+            payload["reasoning_effort"] = cfg.effort
+        else:
+            payload["chat_template_kwargs"] = {"enable_thinking": cfg.thinking}
+        r = await self.client.post(
+            f"{cfg.base_url.rstrip('/')}/v1/chat/completions", json=payload
+        )
+        if r.status_code >= 400:
+            raise HTTPStatusError(r.status_code, r.text)
+        data = r.json()
+        usage = data.get("usage") or {}
+        tokens = (usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
+        choice = data["choices"][0]
+        if (reason := choice.get("finish_reason")) not in ("stop", None):
+            return Verdict(None, error=f"finish_reason={reason}"), tokens
+        text = choice["message"].get("content") or ""
+        try:
+            d = json.loads(text if cfg.constrained else _json_object(text))
+            return Verdict(bool(d["criteria_met"]), d.get("explanation", "")), tokens
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            return Verdict(None, error=f"bad output: {e}"), tokens
+
+
+def _json_object(text: str) -> str:
+    """The outermost {...} of a free reply (markdown fences and prose around it)."""
+    start, end = text.find("{"), text.rfind("}")
+    return text[start : end + 1] if 0 <= start < end else text
+
+
+def make_judge(config: JudgeConfig, cache: VerdictCache | None = None) -> ClaudeJudge:
+    """The judge for `config`: self-hosted if it has a `base_url`, else Claude."""
+    return (OpenAICompatJudge if config.base_url else ClaudeJudge)(config, cache)
 
 
 def _is_client_error(e: Exception) -> bool:

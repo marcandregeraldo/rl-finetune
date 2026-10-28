@@ -1,6 +1,7 @@
 """The judge: prompt rendering, the cache, retries, thinking params; no network."""
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -10,9 +11,12 @@ from rubricrl.judge import prompt
 from rubricrl.judge.client import (
     ClaudeJudge,
     FakeJudge,
+    HTTPStatusError,
     JudgeConfig,
+    OpenAICompatJudge,
     VerdictCache,
     cache_key,
+    make_judge,
 )
 
 MESSAGES = [{"role": "user", "content": "Is smoking good for me?"}]
@@ -164,3 +168,78 @@ def test_reward_judge_uses_the_reward_prompt(monkeypatch):
     monkeypatch.setattr(miles_rm, "_judges", {})
     monkeypatch.setenv("RUBRICRL_PROMPT", prompt.PROMPT_VERSION)
     assert asyncio.run(configs()).prompt_version == prompt.PROMPT_VERSION
+
+
+def _server(*replies):
+    """An in-process OpenAI-compatible server: queued (status, body) replies."""
+    import httpx
+
+    queue, requests = list(replies), []
+
+    def handle(request):
+        requests.append(json.loads(request.content))
+        status, body = queue.pop(0)
+        return httpx.Response(status, json=body)
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handle)), requests
+
+
+def _completion(content, finish="stop"):
+    return 200, {
+        "choices": [{"message": {"content": content}, "finish_reason": finish}],
+        "usage": {"prompt_tokens": 300, "completion_tokens": 40},
+    }
+
+
+def _open_judge(tmp_path, client, **cfg):
+    config = JudgeConfig.named(
+        cfg.pop("model", "qwen3.6-35b-a3b"), base_url="http://judge:30000", **cfg
+    )
+    return OpenAICompatJudge(config, VerdictCache(tmp_path / "c.sqlite"), client)
+
+
+def test_open_judge_request_parse_and_cache(tmp_path):
+    client, requests = _server(
+        _completion('{"explanation": "ok", "criteria_met": true}')
+    )
+    judge = _open_judge(tmp_path, client)
+    v = asyncio.run(judge.grade(MESSAGES, "No.", "[5] x"))
+    assert (v.met, v.explanation, v.input_tokens) == (True, "ok", 300)
+    req = requests[0]
+    assert req["model"] == "qwen3.6-35b-a3b" and req["temperature"] == 0.0
+    assert req["response_format"]["json_schema"]["schema"] == prompt.VERDICT_SCHEMA
+    assert req["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "reasoning_effort" not in req
+    assert asyncio.run(judge.grade(MESSAGES, "No.", "[5] x")).cached
+    assert len(requests) == 1 and judge.usage.cost(judge.config.model) == 0.0
+    # Open-model verdicts never share keys with Claude's.
+    assert cache_key(judge.config, "p") != cache_key(JudgeConfig(), "p")
+
+
+def test_open_judge_retries_5xx_and_truncation_raises_4xx(tmp_path, monkeypatch):
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+    ok = _completion('{"explanation": "", "criteria_met": false}')
+    client, requests = _server((503, {}), _completion('{"expl', "length"), ok)
+    judge = _open_judge(tmp_path, client)
+    assert asyncio.run(judge.grade(MESSAGES, "r", "[1] x")).met is False
+    assert len(requests) == 3 and judge.usage.calls == 2  # the 503 never returned
+
+    client, _ = _server((400, {"error": "bad schema"}))
+    with pytest.raises(HTTPStatusError, match="bad schema"):
+        asyncio.run(_open_judge(tmp_path, client).grade(MESSAGES, "r2", "[1] x"))
+
+
+def test_gpt_oss_reasons_and_unconstrained_replies_parse(tmp_path):
+    reply = 'Verdict:\n```json\n{"explanation": "a", "criteria_met": true}\n```'
+    client, requests = _server(_completion(reply))
+    judge = _open_judge(tmp_path, client, model="gpt-oss-120b", constrained=False)
+    assert asyncio.run(judge.grade(MESSAGES, "No.", "[5] x")).met is True
+    req = requests[0]
+    assert req["reasoning_effort"] == "low" and "chat_template_kwargs" not in req
+    assert "response_format" not in req
+
+
+def test_make_judge_picks_the_backend():
+    assert type(make_judge(JudgeConfig())) is ClaudeJudge
+    config = JudgeConfig.named("gpt-oss-20b", base_url="http://127.0.0.1:30000")
+    assert type(make_judge(config)) is OpenAICompatJudge

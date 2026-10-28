@@ -20,6 +20,8 @@ Configured by environment variables (set in `modal/miles_rft.py`):
     RUBRICRL_EFFORT       low | medium | ...            (default low)
     RUBRICRL_THINKING     1 = adaptive thinking         (default off)
     RUBRICRL_PROMPT       a judge.prompt.TEMPLATES key  (default gepa-v1)
+    RUBRICRL_JUDGE_URL    a self-hosted judge's OpenAI-compatible server
+                          (RUBRICRL_JUDGE is then its served model name)
     RUBRICRL_CONCURRENCY  judge requests in flight      (default 64)
     RUBRICRL_CACHE        SQLite verdict cache          (default ~/.cache/rubricrl)
     RUBRICRL_LOG          JSONL, one line per sample    (default: no log)
@@ -41,7 +43,13 @@ import threading
 import time
 
 from rubricrl.data.schema import Criterion
-from rubricrl.judge.client import ClaudeJudge, JudgeConfig, Usage, VerdictCache
+from rubricrl.judge.client import (
+    ClaudeJudge,
+    JudgeConfig,
+    Usage,
+    VerdictCache,
+    make_judge,
+)
 from rubricrl.judge.prompt import REWARD_PROMPT_VERSION
 from rubricrl.rewards.rubric import axis_scores, score
 
@@ -74,8 +82,9 @@ def _judge() -> ClaudeJudge:
             thinking=os.environ.get("RUBRICRL_THINKING", "") == "1",
             concurrency=int(os.environ.get("RUBRICRL_CONCURRENCY", "64")),
             prompt_version=os.environ.get("RUBRICRL_PROMPT", REWARD_PROMPT_VERSION),
+            base_url=os.environ.get("RUBRICRL_JUDGE_URL") or None,
         )
-        _judges[loop] = ClaudeJudge(config, _cache)
+        _judges[loop] = make_judge(config, _cache)
     return _judges[loop]
 
 

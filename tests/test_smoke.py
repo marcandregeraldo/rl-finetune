@@ -140,12 +140,13 @@ CLIS = {
         "calibration",
         "length-bias",
         "gepa",
+        "self-hosted",
         "baselines",
         "training",
         "all",
     },  # fmt: skip
     "rubricrl.judge.optimize": {"splits", "run", "compare"},
-    "rubricrl.evals.run": {"score", "table", "compare", "physician"},
+    "rubricrl.evals.run": {"score", "table", "compare", "merge", "physician"},
 }
 
 
@@ -264,3 +265,38 @@ def test_export_names_follow_the_base_layout():
     flat = {"model.layers.0.mlp.up_proj.weight"}  # a text-only base
     assert rft.base_name("model_state.model.model.layers.0.mlp.up_proj.weight",
                          flat) == "model.layers.0.mlp.up_proj.weight"  # fmt: skip
+
+
+def test_judge_server_runs_on_its_own_gpus(tmp_path, monkeypatch):
+    import contextlib
+    import urllib.request
+
+    pytest.importorskip("modal")
+    rft = _load(ROOT / "modal" / "miles_rft.py")
+    started = []
+
+    class Proc:
+        def __init__(self, cmd, env, **kw):
+            started.append((cmd, env))
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(rft.subprocess, "Popen", Proc)
+    monkeypatch.setattr(
+        urllib.request, "urlopen", lambda url, timeout: contextlib.nullcontext()
+    )
+    rft.start_judge_server("gpt-oss-20b", [4], tmp_path / "judge.log")
+    rft.start_judge_server("qwen3.6-35b-a3b", [4, 5], tmp_path / "judge.log")
+    rft.start_judge_server("gpt-oss-20b", [4, 5], tmp_path / "judge.log")
+    with pytest.raises(ValueError, match="multiple of 2"):
+        rft.start_judge_server("qwen3.6-35b-a3b", [4], tmp_path / "judge.log")
+    (oss, oss_env), (qwen, qwen_env), (dp, _) = started
+    assert dp[dp.index("--tp") + 1] == "1" and dp[dp.index("--dp-size") + 1] == "2"
+    assert oss[oss.index("--reasoning-parser") + 1] == "gpt-oss"
+    assert oss_env["CUDA_VISIBLE_DEVICES"] == "4" and oss[oss.index("--tp") + 1] == "1"
+    assert (
+        "--reasoning-parser" not in qwen and qwen_env["CUDA_VISIBLE_DEVICES"] == "4,5"
+    )
+    for _repo, rev, gpus in rft.JUDGE_MODELS.values():
+        assert len(rev) == 40 and gpus in (1, 2)
