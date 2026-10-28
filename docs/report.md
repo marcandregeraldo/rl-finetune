@@ -22,7 +22,7 @@ with for several turns?
 
 ## 2. Data and rubrics
 
-![HealthBench conversations and physician rubrics are split into train, val and test conversations and into training and held-out criteria; the Claude Haiku judge is calibrated against physicians and its prompt optimized with GEPA, which produces the reward judge, the in-run eval and the held-out Sonnet judge](diagrams/expert-data-to-reward.svg)
+![HealthBench conversations and physician rubrics are split into train, val and test conversations and into training and held-out criteria; the LLM judge is calibrated against physicians and its prompt optimized with GEPA, which produces the reward judge, the in-run eval and the held-out judge](diagrams/expert-data-to-reward.svg)
 
 *From physician labels to a trusted reward: the judge's prompt is tuned against physicians (balanced F1 0.558 → 0.655; physicians among themselves: 0.672) before it grades the training half of each rubric.*
 
@@ -300,7 +300,7 @@ three on 4 GPUs (two replicas of 2): 0.714, 88%, 50 s. It is the judge for the n
 
 ### 5.1 The environment (v1: one reply)
 
-![In one GRPO step, Miles' agentic rollout runs miles_agent.run for each sample, which plays a consultation over WebSocket against the OpenEnv sidecar, where Claude Haiku plays the patient and the judge grades the finished episode; the reward flows through reward_func, GRPO advantages and FSDP training back to SGLang](diagrams/openenv-episode.svg)
+![In one GRPO step, Miles' agentic rollout runs miles_agent.run for each sample, which plays a consultation over WebSocket against the OpenEnv sidecar, where an LLM plays the patient and an LLM judge grades the finished episode; the reward flows through reward_func, GRPO advantages and FSDP training back to SGLang](diagrams/openenv-episode.svg)
 
 *One GRPO step with `--reward env`: Qwen3.5-4B plays the doctor through Miles' session server, so only the doctor's turns are in the loss; the environment returns the graded episode as the sample's reward. In patient mode the judge grades the whole transcript with the trajectory prompt (§5.4), not `gepa-v1`.*
 
@@ -394,7 +394,7 @@ v0.1.1 pinned by digest, FSDP backend, SGLang colocated on 4 × H100, GRPO with 
 8, TIS (corrects the SGLang-vs-FSDP log-prob gap), clip 0.2 / 0.28, β = 0, lr 1e-6 or 3e-6;
 Qwen3.5-4B, thinking off, 16 prompts × 8 samples, ≤8,192 tokens per reply (≤2,048 per turn in patient mode; 1,024 truncated 53–66% of training replies in the smoke run).
 
-![One Modal container with four H100s holds Miles' driver, an SGLang engine and an FSDP trainer colocated on each GPU, Miles' router and session server, the environment sidecar, the Ray head, Prometheus and Grafana; the Anthropic API, W&B, the browser, two Volumes and the secrets sit outside](diagrams/training-container.svg)
+![One Modal container with four H100s holds Miles' driver, an SGLang engine and an FSDP trainer colocated on each GPU, Miles' router and session server, the environment sidecar, the Ray head, Prometheus and Grafana; the LLM API, W&B, the browser, two Volumes and the secrets sit outside](diagrams/training-container.svg)
 
 *Everything a training run needs lives in one Modal container; the judge, the patient, W&B/Weave and the dashboards reach it from outside.*
 
@@ -506,14 +506,14 @@ A +0.060 [−0.010, 0.127], 31 prompts better and 21 worse; B (to step 10) +0.04
 
 ![Training metrics per rollout step from W&B](figures/training.svg)
 
-*Runs A (blue), B (orange), C (green) and D (gold) per rollout step: reward on the training half with the held-out eval, reply length, truncation, KL to the base model, entropy, groups with no signal, negative criteria met.*
+*Runs A (blue), B (orange), C (green), D (gold) and E (pink, 50 steps, gpt-oss-120b judge, §6.4) per rollout step: reward on the training half with the held-out eval, reply length, truncation, KL to the base model, entropy, groups with no signal, negative criteria met.*
 
-### 6.3 What to monitor, and what tonight's runs looked like
+### 6.3 What to monitor, and what these runs looked like
 
 Three layers, checked in order: a run that fails an earlier one can't be judged on
 a later one.
 
-| Layer | Signal | Tonight (healthy range) | Unhealthy looks like | First check |
+| Layer | Signal | These runs (healthy range) | Unhealthy looks like | First check |
 |---|---|---|---|---|
 | **1. The reward is honest** | episodes without a grade, failed verdicts | 0, 0 | > 1% | the environment and judge logs |
 | | truncated replies | 0–3% (53–66% at a 1,024-token cap) | > 10%: the reward grades the cut | raise the cap, or penalize length |

@@ -1,238 +1,201 @@
-# rl-finetune
+# rl-finetune: HealthBench rubrics as an RL reward
 
-**No RL results yet.** The data, the judge, its calibration, the eval pipeline
-and an [OpenEnv](https://github.com/huggingface/openenv) environment (single reply,
-and a simulated patient) are done and tested. The GRPO runs are next. The write-up,
-step by step: [`docs/report.md`](docs/report.md).
+**The question.** HealthBench grades a model's health conversations with an LLM judge,
+checking each reply against criteria physicians wrote. If that rubric score is the RL
+reward, **does the model get better at health conversations, or learns the grader and
+not the task?**
 
-The question: HealthBench grades a model's health conversations with an LLM judge
-against physician-written rubrics. **If that rubric score is the RL reward, does
-the model get better at health conversations, or better at the grader?**
+## Hypothesis
 
-> HealthBench data → rubric reward graded by a calibrated Claude judge → an RL
-> environment (v1: one reply; v2: a simulated patient, rubrics mapped to whole
-> consultations) → baselines → GRPO with [Miles](https://github.com/radixark/miles)
-> on Modal → eval on held-out criteria, with a held-out judge.
+A rubric score graded by an LLM judge is a usable RL reward if the judge agrees with
+physicians about as well as physicians agree with each other. Training on it then
+improves the answers, not just the score.
 
-![Post-training loop: SGLang rollouts, the rubric reward graded by Claude, GRPO on an FSDP actor, weight sync; in-loop eval on held-out criteria, offline eval under two judges](docs/diagrams/post-training-loop.svg)
+Three results would show that the policy learned the grader instead. Each is checked
+on held-out test conversations:
+1. **It gains on the criteria in the reward, but not on held-out criteria** from the
+   same rubrics.
+2. **It gains under the judge it trained against, but not under a different judge.**
+3. **It gains by writing longer replies, not better ones.** HealthBench's rubrics reward
+   completeness.
 
-## Design
+## Setup
 
-| Decision | Choice | Why |
-|---|---|---|
-| Reward | Rubric score on the **training half** of each conversation's criteria, simple-evals' formula, unclipped | Comparable to published HealthBench scores. Unclipped, so a group whose answers are all net-harmful still has an advantage signal |
-| Hacking detector 1 | **Held-out criteria.** A seeded split per conversation: positives disjoint, negatives in both halves | Gains only on the trained half mean the model is learning the grader, not the task |
-| Hacking detector 2 | **Held-out judge.** Haiku 5.5 with the optimized prompt (`gepa-v1`) grades the reward; the eval grades under that judge *and* under Sonnet 5.5 with simple-evals' prompt | Gains that appear only under the training judge mean it's being exploited |
-| Judge trust | Calibrated against physicians on `oss_meta_eval`, with physician-vs-physician as the ceiling and test-retest (below) | A reward is only as good as its grader. The API has no `temperature`, so judge noise is measured, not set |
-| Algorithm | GRPO, group 8, TIS, ε 0.2 / 0.28, β = 0, lr 1e-6 constant: Modal's tested Miles recipe | TIS corrects the SGLang-vs-FSDP logprob gap. β = 0 keeps KL out of the reward; KL is still logged |
-| Model | Qwen3.5-4B, full fine-tune, FSDP, 1 node × 4 H100; Qwen3.6-35B-A3B as a baseline | A tested Miles path that fits the budget. The 35B-A3B baseline puts any gain in context |
-| Eval harness | Separate from the trainer: SGLang sampling, then this repo's scorer, for every model and checkpoint | The same code scores everything, independent of Miles internals |
+| | |
+|---|---|
+| **Policy** | Qwen3.5-4B, full fine-tune, thinking off |
+| **Data** | [HealthBench](https://openai.com/index/healthbench/): 5,000 conversations with physician rubrics, split train / val / test 75 / 5 / 20% by conversation |
+| **Reward** | The HealthBench score on a *training half* of each rubric's criteria. The other half is held out for evaluation |
+| **Judge** | Claude Haiku 5.5 with a GEPA-optimized prompt (runs A–D), or self-hosted gpt-oss-120b (run E). Both are calibrated against 1,000 physician judgments **before** training |
+| **Training** | GRPO (group 8, trunc. importance sampling, β = 0), 16 prompts × 8 replies per step, 20 steps (run E: 50), with [Miles](https://github.com/radixark/miles) on 4 × H100 on [Modal](https://modal.com) |
+| **Evaluation** | 200 frozen test conversations, 2 replies each. Paired bootstrap 95% CIs against the base model, on the full rubric and on each half, graded by the training judge and a held-out judge (Sonnet 5.5 with another prompt, or the other of Haiku and gpt-oss) |
 
-## Judge calibration
+## Results in short
 
-On 1,000 physician judgments from `oss_meta_eval`, stratified by rubric category.
-The metric is simple-evals': balanced F1 = (F1 on "met" + F1 on "not met") / 2,
-over every (judge, physician) label pair. Physicians are scored against each other
-the same way, on all 29.5K judgments. Run:
-`python -m rubricrl.analysis.calibrate report --n 1000`. In the W&B project
-`rl-finetune` (Weave), every judge call is its own `judge_verdict` trace: filter on
-the run, the category, `repeat` (1 = retest) or `agrees_with_majority = false` to
-read the disagreements. Each run's metrics are a summary-only evaluation.
+- **The best run (C) learned the task.** It gained +0.087 under the judge it trained on,
+  and as much on held-out criteria (+0.091). Under Sonnet, a judge it never saw, it gained
+  +0.058. Longer replies don't explain the gain. All three checks pass.
+- **Part of every gain is the judge's taste.** Each judge credits the policy trained on it
+  by about 0.03 more than a second judge does. Check 2 catches this; check 1 can't,
+  because a judge's taste applies to every criterion.
+- **A better-calibrated judge was not a better reward.** gpt-oss-120b agrees with
+  physicians more than Haiku does (0.714 vs 0.655 balanced F1; physicians with each
+  other: 0.672). Run E, trained against it, improved on its in-run eval. It showed no
+  test-set gain under Haiku (−0.013) and plateaued after step 20.
 
-| Rater | Balanced F1 | F1 met | F1 not met | Says "met" | Test-retest agreement (κ) |
-|---|---|---|---|---|---|
-| Haiku 5.5, effort low, no thinking | 0.558 | 0.652 | 0.463 | 43% | 0.900 (0.608) |
-| Haiku 5.5, effort medium, thinking | 0.587 | 0.701 | 0.473 | 49% | 0.950 (0.847) |
-| Sonnet 5.5, effort low, no thinking | 0.521 | 0.593 | 0.449 | 37% | 1.000 (1.000) |
-| Haiku 5.5, effort low, `gepa-v1` prompt (**the reward**) | 0.655 | 0.819 | 0.491 | 70% | 0.890 (0.738) |
-| Haiku 5.5, effort medium, thinking, `gepa-v1` prompt | 0.662 | 0.811 | 0.512 | 66% | 0.860 (0.693) |
-| Physicians vs each other (181) | 0.672 | | | 78% | |
+![Post-training loop: SGLang rollouts, the rubric reward graded by the judge, GRPO on an FSDP actor, weight sync; in-loop eval on held-out criteria, offline eval under two judges](docs/diagrams/post-training-loop.svg)
 
-On 2,000 judgments, Haiku 5.5 (effort low) scores 0.570 balanced F1, with
-test-retest κ 0.718.
+The full write-up, with every number's source, is [`docs/report.md`](docs/report.md).
+Every training and calibration run is public in W&B
+([`rl-finetune`](https://forge.coreweave.com/wandb/marcandregeraldo-none/rl-finetune)).
+So are the [Weave traces](https://forge.coreweave.com/wandb/marcandregeraldo-none/rl-finetune/weave/traces):
+one per judge verdict and per environment episode, with the conversation, the reply, the
+criterion and the judge's explanation.
 
-Balanced F1 by completion length (quartiles):
+## The task
 
-| Completion (chars) | Haiku low | Haiku medium + thinking | Sonnet low |
+Each HealthBench conversation has a physician rubric of 2 to 48 criteria worth −10 to
++10 points. The policy writes the next assistant reply. A judge checks every criterion as
+met or not met, and the score is the points met over the positive points available.
+
+- **Reward:** the score on the *training half* of each conversation's criteria.
+- **Held-out half:** the other half of the positive criteria, never seen by the reward.
+  Negative criteria are in both halves, so harm is always penalised.
+- **Test set:** 200 test conversations, frozen in [`data/eval_ids.txt`](data/eval_ids.txt).
+- **Environment:** an [OpenEnv](https://github.com/huggingface/openenv) server, either a
+  single reply or a simulated patient over several turns (report §5).
+
+![Physician rubrics split into training and held-out criteria; the judge is calibrated against physicians and its prompt optimized before it grades the reward](docs/diagrams/expert-data-to-reward.svg)
+
+## Step 1: calibrate the judge before training
+
+A reward is only as good as its grader. On 1,000 physician judgments from HealthBench's
+meta-eval, each judge's verdicts are scored against the physicians' with balanced F1
+(the mean of F1 on "met" and on "not met"). Physicians scored against each other set
+the ceiling. Test-retest κ measures how much the verdicts change when the same items
+are graded twice.
+
+| Judge | Prompt | Balanced F1 | Retest κ |
 |---|---|---|---|
-| 3–935 | 0.679 | 0.702 | 0.661 |
-| 938–1,840 | 0.578 | 0.618 | 0.564 |
-| 1,844–3,283 | 0.525 | 0.527 | 0.442 |
-| 3,288–11,265 | 0.446 | 0.521 | 0.411 |
+| Physicians vs each other | | 0.672 | |
+| Claude Haiku 5.5 | simple-evals' | 0.558 | 0.60 |
+| **Claude Haiku 5.5** (reward for runs A–D) | **`gepa-v1`**, GEPA-optimized | **0.655** | 0.74 |
+| **gpt-oss-120b**, self-hosted (reward for run E) | `gepa-v1` | **0.714** | 0.87 |
+| Qwen3.6-35B-A3B, self-hosted | `gepa-v1` | 0.671 | 1.00 |
 
-<!-- Interpretation: yours. -->
+- **The prompt.** [GEPA](https://github.com/gepa-ai/gepa) rewrote the grader prompt
+  against physician labels. Training and validation used conversations disjoint from the
+  test set, and 6 rubric categories were held out entirely.
+- **Length bias.** With simple-evals' prompt, Haiku said "met" less often the longer the
+  reply (0.53 → 0.30 from the shortest to the longest quartile). `gepa-v1` is flat
+  (0.68 → 0.68), so the reward doesn't penalise length.
+- **Report sections:** §4, §4.1 and §4.2.
 
-The meta-eval grades cluster-level ("consensus") rubrics; the reward is mostly
-example-level criteria. API cost of these runs: about $11.
+![Balanced F1 of each judge against physicians, with the physician ceiling](docs/figures/judge-calibration-self-hosted.svg)
 
-## Baselines
+## Step 2: the policy's baseline
 
-The 200-conversation eval subset (`data/eval_ids.txt`). Each score is the mean
-over conversations with a 95% bootstrap CI; the K samples of a conversation are
-averaged first.
+- **Qwen3.5-4B scores 0.500** under the reward's judge on the test set.
+- **Physicians' own ideal answers score 0.211**, under simple-evals' prompt.
+- **The model's replies are 2.4× longer.** The rubrics reward completeness, which is the
+  obvious direction for GRPO to exploit. That is why the evaluation checks length (report §7).
 
-| Run | Judge | Full rubric | Training criteria | Held-out criteria | Chars (median) |
-|---|---|---|---|---|---|
-| Physician ideal completions (172 of 200 conversations) | Haiku 5.5 | 0.211 [0.167, 0.255] | 0.077 [0.012, 0.140] | 0.049 [−0.024, 0.121] | 1,406 |
-| Qwen3.5-0.8B | | | | | |
-| Qwen3.5-4B | | | | | |
-| Qwen3.6-35B-A3B | | | | | |
+## Step 3: GRPO with Miles on Modal
 
-The two halves carry every negative criterion against half the positive points.
-So each half-score sits below the full-rubric score: compare their **gains**
-between runs, not their levels (`python -m rubricrl.evals.run compare`).
+**Setup:**
+- [Miles](https://github.com/radixark/miles) v0.1.1, adapted from Modal's `miles_grpo`
+  example.
+- FSDP, with SGLang colocated on 4 × H100.
+- An in-run eval on 64 validation prompts, graded on the **held-out** half.
+
+Container layout: [`docs/training-architecture.md`](docs/training-architecture.md).
+
+| Run | Change | In-run eval, held-out half | Test gain, Haiku | Test gain, gpt-oss-120b |
+|---|---|---|---|---|
+| A | lr 1e-6 | 0.250 → 0.310 | +0.031 | |
+| B | lr 3e-6 | 0.207 → 0.255 (step 10; checkpoint lost) | | |
+| **C** | B + dynamic sampling | 0.215 → **0.442** | **+0.087** | **+0.062** |
+| D | C + no std-normalization | 0.215 → 0.382 | +0.038 | +0.021 |
+| E | D, judged by gpt-oss-120b, 50 steps | 0.170 → 0.256 (step 20) → 0.210 | −0.013 / −0.017 | +0.016 / +0.020 |
+
+- **Steps:** runs A–D trained for 20 steps.
+- **Test gains:** paired by conversation, over the base model, on the full rubric. For E,
+  the two values are steps 20 and 50.
+- **E's in-run eval:** graded by gpt-oss, so its levels can't be compared with A–D's.
+- **Cost:** about $8–11 of GPU per 20-step run, plus $9–16 of Haiku verdicts. Run E cost
+  about $66 of GPU and no API spend.
+
+![Training metrics per rollout step: reward, reply length, truncation, KL, entropy, groups with no signal, negative criteria met](docs/figures/training.svg)
+
+## What happened
+
+- **C improved on the task, not just on the grader.** Both hacking detectors stay quiet:
+  the gain on held-out criteria matches the gain on trained ones, and it holds under
+  Sonnet. Its replies grew 31%, but given the same conversation, neither judge scores the
+  longer of two replies higher (§7.2). The gain sits in completeness and context
+  awareness.
+- **Dynamic sampling was the lever.** It refills the batch with groups that have signal.
+  At the same learning rate, it took B's KL 0.069 to C's 0.145, and C's entropy fell from
+  1.10 to 0.54 (§6.2).
+- **D was calmer and learned less.** It removed std-normalization from the advantage: the
+  maximum grad norm fell from 14.8 to 4.8, and the test gain fell from +0.087 to +0.038.
+- **Each judge favours its own policy by ~0.03** (see the figure below). C looks better
+  under Haiku, E under gpt-oss. Held-out criteria can't catch this, because a judge's taste
+  applies to every criterion (§8).
+- **E plateaued.** From step 20 to step 50, the test score didn't move under either
+  judge. Replies grew 12%, and Haiku's communication-quality axis fell 0.657 → 0.600 →
+  0.527 (§6.4, §7.1).
+- **Two silent infrastructure bugs:**
+  - Miles' checkpoint converter saved random weights without an error (1 of 724 tensors
+    matched). Exports now fail on a missing tensor and are compared with the base weights.
+  - An NCCL error lost B's only checkpoint (§6.2).
+- **One open question.** Under gpt-oss, E's test gain sits on the held-out half, not the
+  trained half: the reverse of reward hacking (§7.1).
+
+![Test-set gain over the base model for C, D and E under Haiku and gpt-oss-120b, 95% paired CIs; filled dots mark the judge each checkpoint was trained on](docs/figures/two-judges.svg)
+
+## Reproduce
+
+```bash
+uv sync --extra train --extra modal --extra observe --extra env   # Python 3.14, uv.lock
+uv run pytest -q
+
+uv run python -m rubricrl.data.healthbench download                # pinned by sha256
+uv run python -m rubricrl.analysis.calibrate run --n 1000          # the judge vs physicians
+uv run modal run modal/miles_rft.py::main --smoke-test             # 2 GRPO steps
+uv run modal run --detach modal/miles_rft.py::main --num-rollout 20 --lr 3e-6 --dynamic-sampling
+uv run modal run modal/miles_rft.py::export --run-id RUN_ID
+uv run modal run modal/sample.py --model qwen3.5-4b --checkpoint RUN_ID/huggingface/iter_0000020 --name rft-20
+uv run python -m rubricrl.evals.run score runs/samples/rft-20.jsonl
+uv run python -m rubricrl.evals.run compare runs/evals/qwen3.5-4b runs/evals/rft-20
+```
+
+**Needs:**
+- the API keys `ANTHROPIC_API_KEY` and `WANDB_API_KEY`;
+- the Modal secrets `anthropic`, `wandb` and `huggingface-secret`.
+
+Every verdict is cached in SQLite, so reruns are free. Each module's docstring lists its
+commands; the self-hosted judge is in
+[`docs/self-hosted-judge/`](docs/self-hosted-judge/README.md).
 
 ## Layout
 
 | Path | What |
 |---|---|
-| `src/rubricrl/data/` | `schema.py` (Example, Criterion, Judgment); `healthbench.py` (download pinned by sha256, splits, Miles export). See [`data/README.md`](data/README.md) |
-| `src/rubricrl/judge/` | `prompt.py` (simple-evals' grader prompt, verbatim, and the GEPA-optimized `gepa-v1` the reward uses); `client.py` (Claude judge: structured output, retries, SQLite verdict cache, `FakeJudge`); `optimize.py` (GEPA on the grader template against physician labels, optional extra `optimize`) |
-| `src/rubricrl/rewards/` | `rubric.py` (the HealthBench score); `miles_rm.py` (the Miles reward function) |
-| `src/rubricrl/analysis/calibrate.py` | Judge vs physicians, physician ceiling, test-retest, agreement by length |
-| `src/rubricrl/observe.py` | W&B Weave: calibration evaluations, the grader prompt and data versioned, training judge records as traces (optional extra `observe`) |
-| `src/rubricrl/env/` | The OpenEnv environment: `server.py` (`ConsultEnvironment`, single / patient modes, the rubric), `models.py`, `client.py` (typed OpenEnv client), `wire.py` (a dependency-free client for Miles' Python), `miles_agent.py` (Miles' agent function and reward hook), `openenv.yaml` |
-| `src/rubricrl/sim/` | Expert data → simulation: `scenarios.py` (physician criteria mapped to whole consultations, persona, hidden facts), `patient.py` (the simulated patient), `checks.py` (rewrite fidelity, careful vs minimal doctor), `scenario.py` |
-| `src/rubricrl/llm.py` | Structured-output Claude calls with an SQLite cache (scenario builder, patient) |
-| `src/rubricrl/evals/run.py` | Scores samples under each judge: full / training / held-out, per axis, CIs, paired comparison |
-| `modal/sample.py` | SGLang sampling of the eval subset, for any base model or exported checkpoint |
-| `modal/calibrate.py` | Judge calibration on a Modal CPU container, logged to Weave; the verdict cache is merged both ways with the Mac's |
-| `modal/miles_rft.py` | GRPO with Miles on Modal (adapted from Modal's `miles_grpo` example), checkpoint export, and `sync_traces` (the reward log to Weave) |
-| `modal/ray_cluster.py` | Ray on Modal (1 node, or 2 clustered nodes with RDMA) and `rubricrl.cluster_check`, a GPU / NCCL check |
-| `scripts/` | `time_model.py`, `memory_math.py` |
-| `docs/diagrams/` | `.excalidraw` sources and rendered SVGs |
-
-## Setup
-
-```bash
-uv sync --extra train --extra modal --extra observe --extra env   # Python 3.14, uv.lock
-uv run pytest -q
-uv run ruff check . && uv run ruff format --check .
-```
-
-- **API keys:** `ANTHROPIC_API_KEY` and `WANDB_API_KEY`, or on macOS the Keychain
-  items `anthropic-api-key` and `wandb-api-key`.
-- **Modal secrets:** `anthropic`, `wandb`, `huggingface-secret`.
-- **Verdict cache:** every verdict is cached in `~/.cache/rubricrl/judge.sqlite`,
-  so a rerun costs nothing.
-
-## Running
-
-Local, no GPU:
-
-```bash
-uv run python -m rubricrl.data.healthbench download
-uv run python -m rubricrl.data.healthbench export-miles
-```
-
-Judge calibration (Modal CPU, logged to Weave; results land in
-`analysis/out/calibration/`):
-
-```bash
-uv run modal run modal/calibrate.py --backfill    # the table above, all cached: $0
-uv run modal run modal/calibrate.py --judge haiku --effort medium --thinking --n 1000
-uv run python -m rubricrl.analysis.calibrate report --n 1000
-```
-
-Judge prompt optimization (GEPA; train/val disjoint from the calibration test
-set, 6 categories held out), then the winner on the test set. On Modal, one
-detached job does both and logs to W&B; `--gepa-seeds` repeats it on the same data:
-
-```bash
-uv run modal run --detach modal/optimize.py --name gepa-v1
-uv run modal run --detach modal/optimize.py --name gepa-v1 --gepa-seeds 1,2
-uv run modal run modal/optimize.py --pull --name gepa-v1     # results, if detached
-uv run modal run --detach modal/calibrate.py --effort low --n 1000 \
-    --template analysis/out/optimize/gepa-v1/gepa-v1.txt     # the prompt, another judge
-```
-
-Or locally:
-
-```bash
-uv run python -m rubricrl.judge.optimize splits
-uv run python -m rubricrl.judge.optimize run --name gepa-v1 --wandb rl-finetune   # stops at $8
-uv run python -m rubricrl.analysis.calibrate run --judge haiku --effort medium --thinking \
-    --n 1000 --template analysis/out/optimize/gepa-v1/gepa-v1.txt --wandb rl-finetune
-uv run python -m rubricrl.judge.optimize compare \
-    analysis/out/calibration/claude-haiku-5-5-medium-thinking-n1000.json \
-    analysis/out/calibration/claude-haiku-5-5-medium-thinking-gepa-v1-n1000.json
-```
-
-The environment (local; `--reward env` runs it inside the training container):
-
-```bash
-uv run python -m rubricrl.sim.scenarios build --split test --n 100   # v2 scenarios (~$2)
-uv run python -m rubricrl.sim.checks fidelity --split test --n 100   # rewrite fidelity
-uv run python -m rubricrl.sim.checks doctors --split test --n 20 --wandb rl-finetune
-uv run uvicorn rubricrl.env.server:app --port 8003                   # the OpenEnv server
-```
-
-Baselines (Modal, then local scoring):
-
-```bash
-uv run modal run modal/sample.py --model qwen3.5-4b          # -> runs/samples/qwen3.5-4b.jsonl
-uv run python -m rubricrl.evals.run score runs/samples/qwen3.5-4b.jsonl --estimate
-uv run python -m rubricrl.evals.run score runs/samples/qwen3.5-4b.jsonl    # haiku, sonnet:1
-```
-
-GRPO (Modal):
-
-```bash
-uv run modal run modal/miles_rft.py::main --task math --smoke-test    # the pipeline, no judge
-uv run modal run modal/miles_rft.py::main --smoke-test                # 2 steps with the judge
-uv run modal run modal/miles_rft.py::main --smoke-test --reward env   # the same, through the environment
-uv run modal run modal/miles_rft.py::main --smoke-test --reward env --env-mode patient
-uv run modal run --detach modal/miles_rft.py::main --num-rollout 60
-uv run modal run --detach modal/miles_rft.py::main --reward env --no-dashboard  # without the Ray dashboard and Grafana (on by default)
-uv run modal run modal/miles_rft.py::ray_check --hold-s 600            # try the dashboard + Grafana login (CPU, ~$0.05)
-uv run modal run modal/miles_rft.py::log_check                         # every key a step logs to W&B (CPU, ~$0.10)
-uv run modal run modal/miles_rft.py::sync_traces --run-id RUN_ID    # any time; --final at the end
-uv run modal run modal/miles_rft.py::export --run-id RUN_ID
-uv run modal run modal/sample.py --model qwen3.5-4b --checkpoint RUN_ID/huggingface/iter_0000060 --name rft-60
-uv run python -m rubricrl.evals.run score runs/samples/rft-60.jsonl
-uv run python -m rubricrl.evals.run compare runs/evals/qwen3.5-4b runs/evals/rft-60
-```
-
-### Costs, measured or estimated
-
-| Item | Cost |
-|---|---|
-| Haiku 5.5 verdict | ~$0.0003 (~2K input tokens, ~150 output tokens) |
-| Sonnet 5.5 verdict | ~$0.005 |
-| Eval of one model: Haiku on K = 2 + Sonnet on K = 1 | ~$1.3 + ~$10 |
-| Training step: 128 responses × ~7.8 criteria ≈ 1,000 Haiku verdicts | ~$0.30 (effort low), ~$0.60 (medium + thinking) |
-| Modal: 4 × H100 node | ~$16/h of GPU, ~$19/h with CPU and memory |
-
-## Ray on Modal
-
-![Ray on Modal: the Mac spawns a 2-node clustered function; rank 0 runs the Ray head and submits the experiment as a Ray Job, rank 1 joins as a worker](docs/diagrams/ray-on-modal.svg)
-
-`modal/ray_cluster.py --entry check` brings up a Ray cluster: one node with 1–8
-H100s, or two 8-GPU nodes with RDMA. It runs `rubricrl.cluster_check` on it,
-which times an NCCL all-reduce across every GPU and prints versions. Training
-doesn't use this app: Miles runs in its own image, with its own single-node Ray
-head (`modal/miles_rft.py`).
-
-```bash
-uv run modal run modal/ray_cluster.py --entry check --gpus 8
-uv run modal run --detach modal/ray_cluster.py --entry check --nodes 2
-```
-
-## Diagrams
-
-The sources are `docs/diagrams/*.excalidraw`: open and edit them on
-excalidraw.com, in the Virgil font. Re-render the SVG after an edit; the fonts are
-embedded, so GitHub shows them:
-
-```bash
-npx -y mcp-excalidraw-server@2.1.2 render docs/diagrams/post-training-loop.excalidraw \
-    --out docs/diagrams/post-training-loop.svg
-```
+| `src/rubricrl/data/` | HealthBench download, splits, the Miles export ([`data/README.md`](data/README.md)) |
+| `src/rubricrl/judge/` | The grader prompts (simple-evals', `gepa-v1`), the Claude and self-hosted judges, GEPA |
+| `src/rubricrl/rewards/` | The HealthBench score; the Miles reward function and logging hooks |
+| `src/rubricrl/analysis/` | Calibration against physicians; the figures |
+| `src/rubricrl/env/`, `sim/` | The OpenEnv environment; the simulated patient and its checks |
+| `src/rubricrl/evals/` | Scoring under several judges, bootstrap CIs, paired comparisons |
+| `modal/miles_rft.py` | GRPO with Miles on Modal, export, the self-hosted judge |
+| `modal/sample.py`, `calibrate.py`, `optimize.py` | Sampling checkpoints; calibration and GEPA on Modal |
+| `docs/` | [The report](docs/report.md), [training architecture](docs/training-architecture.md), [diagrams](docs/diagrams/README.md), [a Megatron LoRA plan](docs/megatron-lora/README.md) |
 
 ## Credits
 
 - **HealthBench** data and grader prompt: OpenAI's
   [simple-evals](https://github.com/openai/simple-evals), MIT.
 - **The Miles recipe on Modal:**
-  [modal-examples `14_clusters/miles_grpo.py`](https://github.com/modal-labs/modal-examples),
-  MIT.
+  [modal-examples `14_clusters/miles_grpo.py`](https://github.com/modal-labs/modal-examples), MIT.
+- **Licence:** MIT ([`LICENSE`](LICENSE)).

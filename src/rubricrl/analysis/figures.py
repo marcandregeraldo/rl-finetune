@@ -11,6 +11,7 @@ history. Rerun after new results land; nothing here is copied from the report.
     python -m rubricrl.analysis.figures gepa                 # §4.1: GEPA's candidates
     python -m rubricrl.analysis.figures self-hosted          # §4.2: open-model judges
     python -m rubricrl.analysis.figures baselines            # §7: eval scores, 95% CIs
+    python -m rubricrl.analysis.figures two-judges           # §7.1: gains, 2 judges
     python -m rubricrl.analysis.figures training --run aqcpypgj --run <id> ...  # §6
 
 Needs the `observe` extra (matplotlib; wandb for `training`, which only reads):
@@ -48,7 +49,15 @@ from rubricrl.judge.prompt import (
 OUT = Path("docs/figures")
 OPTIMIZE = Path("analysis/out/optimize")
 WANDB_PROJECT = "marcandregeraldo-none/rl-finetune"
-RUNS = ("aqcpypgj",)  # the training runs `training` / `all` plot by default
+# The training runs `training` / `all` plot by default, with the report's names (§6).
+RUN_NAMES = {
+    "aqcpypgj": "A: lr 1e-6",
+    "vd00i7jk": "B: lr 3e-6",
+    "s5yq2faq": "C: lr 3e-6 + dynamic sampling",
+    "vmgc5lf8": "D: C + no std-normalization",
+    "sjyp2hav": "E: D + gpt-oss-120b judge (stopped at 50)",
+}
+RUNS = tuple(RUN_NAMES)
 
 # The calibration labels (`calibrate.label`) of the reward's judge and of the
 # judge it replaced: Haiku, effort low, with `gepa-v1` / simple-evals' prompt.
@@ -61,7 +70,7 @@ INK = "#7d7d7d"  # text and ticks: 4.1:1 on white, 4.6:1 on #0d1117
 REF = "#8c8c8c"  # reference marks (physicians, other judges)
 BLUE, ORANGE, AQUA = "#2a78d6", "#d95926", "#199e70"
 # Categorical order for overlaid runs: the reference palette's dark-mode steps,
-# validated (scripts/validate_palette.js) on both GitHub surfaces.
+# checked for contrast on both GitHub surfaces.
 SERIES = (BLUE, ORANGE, AQUA, "#c98500", "#d55181", "#008300", "#9085e9", "#e66767")
 PROMPT_COLORS = {PROMPT_VERSION: ORANGE, REWARD_PROMPT_VERSION: BLUE}
 
@@ -503,6 +512,87 @@ def baselines(src: Path = evals.OUT, out: Path = OUT) -> Path:
     return _save(fig, out, "baselines", "Baselines")
 
 
+# --- Gains under two judges (§7.1) -----------------------------------------------
+
+# The base model's eval dir and the checkpoints, each graded by both judges
+# (`evals.run merge`), with the judge that produced its reward.
+GAIN_BASE = "qwen3.5-4b-gepa-v1"
+GAIN_RUNS = (
+    ("rft-C-lr3e-6-dynsam", "C", "haiku"),
+    ("rft-D-lr3e-6-dynsam-nostd", "D", "haiku"),
+    ("rft-E20-gpt-oss-120b", "E, step 20", "gpt-oss-120b"),
+    ("rft-E50-gpt-oss-120b", "E, step 50", "gpt-oss-120b"),
+)
+GAIN_JUDGES = (("haiku@gepa-v1", BLUE), ("gpt-oss-120b@gepa-v1", AQUA))
+
+
+def gain_rows(
+    src: Path, base: str = GAIN_BASE, runs: Sequence[tuple] = GAIN_RUNS
+) -> list[dict]:
+    """Per checkpoint and judge: the full-rubric gain over the base model, paired
+    over conversations (`evals.run compare`'s numbers)."""
+    rb = evals._records(src / base)
+    rows = []
+    for name, label, trained_on in runs:
+        rn = evals._records(src / name)
+        for judge, color in GAIN_JUDGES:
+            a = evals._by_conversation(rb, judge, "full")
+            b = evals._by_conversation(rn, judge, "full")
+            if not (a and b):
+                raise click.ClickException(f"no {judge} verdicts in {base} or {name}")
+            model, _, _ = evals.parse_judge(judge)
+            rows.append(
+                {
+                    "run": label,
+                    "key": judge,
+                    "judge": _model(model),
+                    "own": model == trained_on,
+                    "color": color,
+                    **evals.paired_diff(a, b),
+                }
+            )
+    return rows
+
+
+def two_judges(src: Path = evals.OUT, out: Path = OUT) -> Path:
+    """Test-set gain over the base model under each judge, 95% paired CIs; the
+    judge each checkpoint was trained on is the filled dot."""
+    from matplotlib.lines import Line2D
+
+    plt = _plt()
+    rows = gain_rows(src)
+    runs = list(dict.fromkeys(r["run"] for r in rows))
+    fig, ax = plt.subplots(figsize=(7, 0.62 * len(runs) + 1.0))
+    offsets = {j: 0.14 - 0.28 * i for i, (j, _) in enumerate(GAIN_JUDGES)}
+    for r in rows:
+        y = len(runs) - 1 - runs.index(r["run"])
+        y += offsets[r["key"]]
+        lo, hi = r["ci95"]
+        ax.plot([lo, hi], [y, y], color=r["color"], lw=2, alpha=0.45)
+        ax.scatter([r["mean"]], [y], s=48, zorder=3, linewidths=1.6,
+                   color=r["color"] if r["own"] else "none",
+                   edgecolors=r["color"])  # fmt: skip
+        ax.annotate(f"{r['mean']:+.3f}", (hi, y), xytext=(5, 0),
+                    textcoords="offset points", va="center", fontsize=7.5)  # fmt: skip
+    ax.axvline(0, color=INK, lw=0.6, alpha=0.6)
+    names = {r["run"]: f"{r['run']}\n(reward: {r['judge']})" for r in rows if r["own"]}
+    ax.set_yticks(range(len(runs))[::-1], [names[x] for x in runs])
+    ax.set_ylim(-0.6, len(runs) - 0.4)
+    ax.grid(axis="y", visible=False)
+    ax.spines["left"].set_visible(False)
+    hollow = Line2D([], [], color=INK, marker="o", lw=0, ms=6, markerfacecolor="none",
+                    label="hollow: not the judge it trained on")  # fmt: skip
+    handles = [
+        Line2D([], [], color=c, marker="o", lw=0, ms=6,
+               label=f"graded by {_model(j.split('@')[0])}")
+        for j, c in GAIN_JUDGES
+    ] + [hollow]  # fmt: skip
+    ax.legend(handles=handles, fontsize=7.5, ncol=3, loc="upper center",
+              bbox_to_anchor=(0.45, -0.2))  # fmt: skip
+    ax.set_xlabel("full-rubric gain over Qwen3.5-4B, test set, 95% paired CI")
+    return _save(fig, out, "two-judges", "Gains under two judges")
+
+
 # --- Training (§6) ---------------------------------------------------------------
 
 # (title, [(W&B key, step key, style name)], y format)
@@ -559,11 +649,14 @@ def fetch_runs(run_ids: Sequence[str], project: str) -> list[dict]:
 
 
 def run_labels(runs: Sequence[dict]) -> tuple[list[str], list[str]]:
-    """Legend labels: each run's id and the tags not shared by every run; and the
-    shared tags."""
+    """Legend labels: the report's name for a known run, else its id and the tags
+    not shared by every run; and the shared tags."""
     shared = [t for t in runs[0]["tags"] if all(t in r["tags"] for r in runs)]
     labels = []
     for r in runs:
+        if r["id"] in RUN_NAMES:
+            labels.append(f"{RUN_NAMES[r['id']]} ({r['id']})")
+            continue
         own = [t for t in r["tags"] if t not in shared]
         state = "" if r["state"] == "finished" else f" ({r['state']})"
         labels.append(r["id"] + (" · " + ", ".join(own) if own else "") + state)
@@ -708,6 +801,20 @@ def baselines_cmd(src: Path, out: Path) -> None:
     baselines(src, out)
 
 
+@main.command("two-judges")
+@click.option(
+    "--evals",
+    "src",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=evals.OUT,
+    show_default=True,
+)
+@_out
+def two_judges_cmd(src: Path, out: Path) -> None:
+    """Gain over the base model per checkpoint, under Haiku and gpt-oss."""
+    two_judges(src, out)
+
+
 @main.command("training")
 @_runs
 @_project
@@ -728,6 +835,7 @@ def all_cmd(run_ids: tuple[str, ...], project: str, out: Path) -> None:
     self_hosted(out=out)
     gepa(out=out)
     baselines(out=out)
+    two_judges(out=out)
     training(run_ids, project, out)
 
 

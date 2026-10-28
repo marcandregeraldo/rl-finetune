@@ -10,6 +10,7 @@ name = "rl-finetune"
 version = "0.1.0"
 description = "HealthBench rubric-reward RL: data, a calibrated Claude judge, evals, and GRPO with Miles on Modal"
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.14,<3.15"
 # Data, judge, rewards and evals: no torch. The Miles image installs this package
 # with --no-deps on top of its own environment (see modal/miles_rft.py).
@@ -24,8 +25,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# The cluster check (modal/ray_cluster.py installs this extra from uv.lock) and
-# scripts/time_model.py. Training itself runs in the Miles image.
+# The cluster check (modal/ray_cluster.py installs this extra from uv.lock).
+# Training itself runs in the Miles image.
 train = [
     "torch>=2.6",
     "transformers>=4.57",
@@ -79,7 +80,6 @@ line-ending = "lf"
 select = ["E", "W", "F", "I", "B", "UP"]
 
 [tool.ruff.lint.per-file-ignores]
-"scripts/memory_math.py" = ["E501"]  # wide table rows, kept readable
 "src/rubricrl/judge/prompt.py" = ["E501"]  # simple-evals' template, verbatim
 "src/rubricrl/sim/{patient,scenarios}.py" = ["E501"]  # prompt templates, verbatim prose
 "src/rubricrl/judge/optimize.py" = ["E501"]  # the reflection prompt, verbatim prose

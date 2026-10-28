@@ -142,6 +142,7 @@ CLIS = {
         "gepa",
         "self-hosted",
         "baselines",
+        "two-judges",
         "training",
         "all",
     },  # fmt: skip
