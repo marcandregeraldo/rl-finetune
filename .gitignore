@@ -42,3 +42,9 @@ wandb/
 .cache/
 analysis/out/
 *.log
+
+# Local planning and Mac-era scripts (kept on disk, not published)
+PLAN.md
+scripts/
+notes/
+*.sqlite

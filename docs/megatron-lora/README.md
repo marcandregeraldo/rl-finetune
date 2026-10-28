@@ -1,7 +1,6 @@
 # Plan: Qwen3.6-35B-A3B with LoRA on Miles' Megatron backend
 
-The stretch row of [`PLAN.md`](../../PLAN.md), made concrete on 27 Oct so it can be picked up
-on the morning of Wed 28 Oct. The 4B full-fine-tuning path (`--train-backend fsdp`) stays as
+A stretch goal, made concrete so it can be picked up later. The 4B full-fine-tuning path (`--train-backend fsdp`) stays as
 it is; this adds a second path next to it.
 
 **Status:** plan only. Nothing below is implemented yet.
@@ -53,9 +52,6 @@ it is; this adds a second path next to it.
    4-GPU run.
 2. **Reply cap 4,096 (recommended for the first run) or 8,192.** The reference caps tokens
    per GPU at 4,096, and this model's sequences can't be packed.
-3. **Before or after the interview.** The morning of Wed 28 is reserved for debugging rep 2
-   and the Baseten drill, with a hard stop on new material at 11:00. Steps 6–8 below take about
-   10 minutes of attention if nothing breaks.
 
 ## Steps
 
@@ -97,7 +93,7 @@ it is; this adds a second path next to it.
    - `rollout/rubric/*` present.
 
    **No-go:** retry once only if the error names the fix (out of memory → lower the reply cap
-   or switch to 8 GPUs). Otherwise stop. No debugging after 8:30 on interview day.
+   or switch to 8 GPUs). Otherwise stop.
 7. **The run** (rough estimate: 2–3 hours, $70–100 of GPU plus about $10 of judge calls on
    8 GPUs):
 
@@ -106,7 +102,7 @@ it is; this adds a second path next to it.
      --model qwen3.6-35b-a3b --reward env --num-rollout 20
    ```
 
-### After the interview
+### Then
 
 8. **Eval path:**
    - `modal/sample.py` serves the `--save-hf` export.
@@ -114,12 +110,3 @@ it is; this adds a second path next to it.
      halves.
 9. **Routing replay:** if step 6 showed a wide trainer–SGLang gap, add
    `--use-rollout-routing-replay` and compare.
-
-## Morning timeline, if steps 1–4 are not done the night before
-
-| Time | Claude | You |
-|---|---|---|
-| 6:00 | Steps 1–4 (approve tool calls as they come) | Fundamentals card, then debugging rep 2 |
-| ~8:00 | Report: checks green, or stop | Launch step 5 |
-| ~8:30 | | Step 6: go → launch step 7; no-go → stop |
-| 11:00 | | Hard stop. The run finishes on its own |
