@@ -1,19 +1,25 @@
-"""Check a Ray cluster before training on it: GPUs, placement and NCCL bandwidth.
+"""Check a Ray cluster before training on it: GPUs, versions, NCCL bandwidth.
 
 One Ray actor per GPU in the cluster. The actors form one NCCL process group and
 time an all-reduce, so a 2-node run shows whether traffic between nodes goes over
 RDMA: look for `NET/IB` (RDMA) vs `NET/Socket` (TCP) in the NCCL INFO lines, and at
-the bus bandwidth (same definition as nccl-tests).
+the bus bandwidth (same definition as nccl-tests). It also prints the Python, torch
+and Ray versions the cluster runs, to compare with the Mac's (same uv.lock).
 
-Entry point for `modal/ray_cluster.py` (`--entry check`); also runs on any Ray
-cluster: `main({})` after `ray.init(...)`.
+    python -m rubricrl.cluster_check [--config run.yaml]   # on any Ray cluster
+
+Submitted as a Ray Job by `modal/ray_cluster.py --entry check`. Config keys
+(optional): `mib` (all-reduce size, default 1024), `iters` (default 10).
 """
 
+import platform
 import socket
 import time
 from typing import Any
 
+import click
 import ray
+import yaml
 
 
 @ray.remote(num_gpus=1)
@@ -50,6 +56,13 @@ class _Rank:
             "rank": rank,
             "node": ray.util.get_node_ip_address(),
             "gpu": torch.cuda.get_device_name(dev),
+            "versions": {
+                "python": platform.python_version(),
+                "torch": torch.__version__,
+                "cuda": torch.version.cuda,
+                "nccl": ".".join(map(str, torch.cuda.nccl.version())),
+                "ray": ray.__version__,
+            },
             "ms": round(dt * 1e3, 2),
             # All-reduce moves 2 (n - 1) / n of the buffer per rank.
             "busbw_GBps": round(size / dt * 2 * (world - 1) / world / 1e9, 1),
@@ -79,8 +92,23 @@ def main(cfg: dict[str, Any]) -> dict[str, Any]:
         "nodes": len(nodes),
         "gpus": world,
         "gpu": rows[0]["gpu"],
+        "versions": rows[0]["versions"],
         "all_reduce_MiB": mib,
         "busbw_GBps_min": min(r["busbw_GBps"] for r in rows),
     }
     print(summary)
     return summary
+
+
+@click.command(help=__doc__.split("\n\n")[0])
+@click.option(
+    "--config", type=click.File(), help="YAML file (optional keys: mib, iters)"
+)
+def cli(config) -> None:
+    cfg = yaml.safe_load(config) if config else {}
+    ray.init()  # inside a Ray Job: joins the cluster it was submitted to
+    main(cfg or {})
+
+
+if __name__ == "__main__":
+    cli()

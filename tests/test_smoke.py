@@ -1,5 +1,7 @@
-"""Smoke: packages import, the Modal app loads, the cluster check runs on CPU Ray."""
+"""Smoke: packages import, the Modal apps load, the cluster check runs on CPU Ray,
+and what runs inside the Miles image (Python 3.12) parses as Python 3.10."""
 
+import ast
 import importlib
 import importlib.util
 from pathlib import Path
@@ -8,15 +10,34 @@ import pytest
 
 ROOT = Path(__file__).parent.parent
 MODULES = [
-    "nanorft.algos",
-    "nanorft.cluster_check",
-    "nanorft.driver",
-    "nanorft.generator",
-    "nanorft.learner",
-    "nanorft.protocol",
-    "nanorft.reference",
-    "nanorft.reward_worker",
-    "nanorft.tracking",
+    "rubricrl.analysis.calibrate",
+    "rubricrl.cluster_check",
+    "rubricrl.data.healthbench",
+    "rubricrl.data.schema",
+    "rubricrl.evals.run",
+    "rubricrl.judge.client",
+    "rubricrl.judge.prompt",
+    "rubricrl.observe",
+    "rubricrl.rewards.miles_rm",
+    "rubricrl.rewards.rubric",
+    "rubricrl.llm",
+    "rubricrl.sim.patient",
+    "rubricrl.sim.scenario",
+    "rubricrl.sim.scenarios",
+    "rubricrl.env.miles_agent",
+    "rubricrl.env.wire",
+]
+# Imported by Miles' reward hook, or by Modal inside the Miles image.
+IN_MILES_IMAGE = [
+    "src/rubricrl/data/schema.py",
+    "src/rubricrl/judge/client.py",
+    "src/rubricrl/judge/prompt.py",
+    "src/rubricrl/rewards/miles_rm.py",
+    "src/rubricrl/rewards/rubric.py",
+    "src/rubricrl/env/miles_agent.py",
+    "src/rubricrl/env/wire.py",
+    "modal/miles_rft.py",
+    "modal/sample.py",
 ]
 
 
@@ -25,20 +46,84 @@ def test_imports(name):
     importlib.import_module(name)
 
 
-def test_modal_app_loads():
-    pytest.importorskip("modal")
-    spec = importlib.util.spec_from_file_location(
-        "ray_cluster", ROOT / "modal" / "ray_cluster.py"
-    )
+@pytest.mark.parametrize("path", IN_MILES_IMAGE)
+def test_parses_as_python_310(path):
+    ast.parse((ROOT / path).read_text(), feature_version=(3, 10))
+
+
+def _load(path: Path):
+    spec = importlib.util.spec_from_file_location(path.stem, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    assert module.PYTHON_VERSION == (ROOT / ".python-version").read_text().strip()
-    assert set(module.ENTRIES) == {"check", "train"}
+    return module
+
+
+def test_modal_apps_load():
+    pytest.importorskip("modal")
+    ray_cluster = _load(ROOT / "modal" / "ray_cluster.py")
+    local = (ROOT / ".python-version").read_text().strip()
+    assert local.startswith(ray_cluster.PYTHON_SERIES + ".")
+    assert ray_cluster.ENTRIES == {"check": "rubricrl.cluster_check"}
+    rft = _load(ROOT / "modal" / "miles_rft.py")
+    sample = _load(ROOT / "modal" / "sample.py")
+    # The two apps share a Volume layout: same names, same pinned revisions.
+    for name, (repo, rev) in rft.MODELS.items():
+        assert sample.MODELS[name][:2] == (repo, rev)
+
+
+def test_calibrate_app_loads():
+    pytest.importorskip("modal")
+    app = _load(ROOT / "modal" / "calibrate.py")
+    assert app.app.name == "rubricrl-calibrate" and len(app.BACKFILL) == 4
+    rft = _load(ROOT / "modal" / "miles_rft.py")
+    assert rft.sync_traces is not None and rft.COMMIT_EVERY_S > 0
+
+
+def test_optimize_app_loads():
+    pytest.importorskip("modal")
+    app = _load(ROOT / "modal" / "optimize.py")
+    assert app.app.name == "rubricrl-optimize" and app.CACHES == (
+        "judge.sqlite",
+        "llm.sqlite",
+    )
+
+
+def test_without_weave_installed():
+    """The base install and the Miles image don't have weave: nothing else needs it."""
+    import subprocess
+    import sys
+
+    code = (
+        "import sys; sys.modules['weave'] = None\n"
+        "import rubricrl.rewards.miles_rm, rubricrl.judge.client\n"
+        "import rubricrl.analysis.calibrate, rubricrl.evals.run, rubricrl.observe\n"
+        "import rubricrl.sim.scenarios, rubricrl.sim.patient\n"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)
+
+
+def test_miles_args_are_well_formed(tmp_path):
+    pytest.importorskip("modal")
+    rft = _load(ROOT / "modal" / "miles_rft.py")
+    args = rft.training_args("healthbench", "qwen3.5-4b", tmp_path / "run", 60, False)
+    flags = [a for a in args if a.startswith("--")]
+    assert len(flags) == len(set(flags)), "a flag is set twice"
+    i = args.index("--custom-rm-path")
+    assert args[i + 1] == "rubricrl.rewards.miles_rm.healthbench_reward"
+    assert int(args[args.index("--global-batch-size") + 1]) == 16 * 8  # on-policy
+    assert (
+        args[args.index("--apply-chat-template-kwargs") + 1]
+        == '{"enable_thinking": false}'
+    )
+    smoke = rft.training_args("healthbench", "qwen3.5-4b", tmp_path / "run", 2, True)
+    assert any(a.endswith("healthbench_val.jsonl@[0:8]") for a in smoke)
+    math = rft.training_args("math", "qwen3.5-4b", tmp_path / "run", 2, True)
+    assert "--custom-rm-path" not in math and "math" in math
 
 
 def test_cluster_check_needs_gpus():
     ray = pytest.importorskip("ray")
-    from nanorft import cluster_check
+    from rubricrl import cluster_check
 
     ray.init(num_cpus=1, num_gpus=0, include_dashboard=False)
     try:
@@ -46,3 +131,172 @@ def test_cluster_check_needs_gpus():
             cluster_check.main({})
     finally:
         ray.shutdown()
+
+
+CLIS = {
+    "rubricrl.data.healthbench": {"download", "stats", "export-miles"},
+    "rubricrl.analysis.calibrate": {"estimate", "run", "report", "vote", "lengths"},
+    "rubricrl.analysis.figures": {
+        "calibration",
+        "length-bias",
+        "gepa",
+        "self-hosted",
+        "baselines",
+        "training",
+        "all",
+    },  # fmt: skip
+    "rubricrl.judge.optimize": {"splits", "run", "compare"},
+    "rubricrl.evals.run": {"score", "table", "compare", "merge", "physician"},
+}
+
+
+@pytest.mark.parametrize("name", CLIS)
+def test_cli_help(name):
+    from click.testing import CliRunner
+
+    group = importlib.import_module(name).main
+    assert set(group.commands) == CLIS[name]
+    for cmd in [[], *([c] for c in CLIS[name])]:
+        result = CliRunner().invoke(group, [*cmd, "--help"])
+        assert result.exit_code == 0, result.output
+
+
+def test_cli_options_match_the_functions_they_forward_to():
+    """`score` and `run` pass their options through as **kwargs."""
+    import inspect
+
+    from rubricrl.analysis import calibrate
+    from rubricrl.evals import run
+
+    for cmd, fn in [
+        (run.main.commands["score"], run.score_file),
+        (calibrate.main.commands["run"], calibrate.run),
+    ]:
+        assert {p.name for p in cmd.params} == set(inspect.signature(fn).parameters)
+
+
+def test_miles_side_of_the_environment_needs_no_openenv():
+    """Miles' Python gets neither openenv's server stack nor weave/wandb."""
+    import subprocess
+    import sys
+
+    code = (
+        "import sys\n"
+        "for m in ('openenv', 'weave', 'wandb', 'fastapi', 'gradio'):\n"
+        "    sys.modules[m] = None\n"
+        "import rubricrl.env.miles_agent, rubricrl.env.wire\n"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)
+
+
+def test_miles_env_args(tmp_path):
+    pytest.importorskip("modal")
+    rft = _load(ROOT / "modal" / "miles_rft.py")
+    for mode, prefix, seq in (
+        ("single", "healthbench", "10240"),
+        ("patient", "consult", "16384"),
+    ):
+        args = rft.training_args(
+            "healthbench", "qwen3.5-4b", tmp_path / "run", 2, True, "env", mode
+        )
+        flags = [a for a in args if a.startswith("--")]
+        assert len(flags) == len(set(flags)), "a flag is set twice"
+        assert args[args.index("--custom-agent-function-path") + 1] == (
+            "rubricrl.env.miles_agent.run"
+        )
+        assert args[args.index("--custom-rm-path") + 1] == (
+            "rubricrl.env.miles_agent.reward_func"
+        )
+        assert args[args.index("--tito-model") + 1] == "qwen35"
+        assert args[args.index("--max-seq-len") + 1] == seq
+        assert "--use-session-server" in args
+        assert "--apply-chat-template" not in args  # the session server renders it
+        assert args[args.index("--prompt-data") + 1].endswith(f"{prefix}_train.jsonl")
+        assert args[args.index("--custom-rollout-log-function-path") + 1] == (
+            "rubricrl.rewards.miles_log.log_rollout"
+        )
+    rm = rft.training_args("healthbench", "qwen3.5-4b", tmp_path / "run", 2, True)
+    assert "--apply-chat-template" in rm and "--use-session-server" not in rm
+    assert "--custom-eval-rollout-log-function-path" in rm
+    math = rft.training_args("math", "qwen3.5-4b", tmp_path / "run", 2, True)
+    assert "--custom-rollout-log-function-path" not in math
+    assert rm[rm.index("--lr") + 1] == "1e-06"
+    assert "--dynamic-sampling-filter-path" not in rm
+    tuned = rft.training_args("healthbench", "qwen3.5-4b", tmp_path / "run", 2, True,
+                              "env", lr=3e-6, dynamic_sampling=True)  # fmt: skip
+    assert tuned[tuned.index("--lr") + 1] == "3e-06"
+    full = rft.training_args("healthbench", "qwen3.5-4b", tmp_path / "run", 20, False)
+    assert full[full.index("--save-interval") + 1] == "5"
+    assert tuned[tuned.index("--save-interval") + 1] == "2"  # smoke: at the end
+    assert "--disable-grpo-std-normalization" not in tuned
+    dr = rft.training_args("healthbench", "qwen3.5-4b", tmp_path / "run", 20, False,
+                           "env", std_normalization=False)  # fmt: skip
+    assert "--disable-grpo-std-normalization" in dr
+    small = rft.training_args("healthbench", "qwen3.5-4b", tmp_path / "run", 20, False,
+                              "env", gpus=2, prompts_per_step=32)  # fmt: skip
+    assert small[small.index("--actor-num-gpus-per-node") + 1] == "2"
+    assert small[small.index("--rollout-batch-size") + 1] == "32"
+    assert small[small.index("--global-batch-size") + 1] == "256"
+    assert full[full.index("--actor-num-gpus-per-node") + 1] == "4"
+    assert tuned[tuned.index("--dynamic-sampling-filter-path") + 1].endswith(
+        "apply_reward_nonzero_std_filter"
+    )
+    assert len([a for a in tuned if a.startswith("--")]) == len(
+        {a for a in tuned if a.startswith("--")}
+    )
+
+
+def test_export_names_follow_the_base_layout():
+    pytest.importorskip("modal")
+    rft = _load(ROOT / "modal" / "miles_rft.py")
+    base = {"model.language_model.layers.0.mlp.up_proj.weight", "lm_head.weight",
+            "model.visual.blocks.0.attn.qkv.weight"}  # fmt: skip
+    # the FSDP checkpoint's names (Qwen3.5 run 11a3f8)
+    for key, want in (
+        ("model_state.model.model.language_model.layers.0.mlp.up_proj.weight",
+         "model.language_model.layers.0.mlp.up_proj.weight"),
+        ("model_state.model.model.visual.blocks.0.attn.qkv.weight",
+         "model.visual.blocks.0.attn.qkv.weight"),
+        ("model_state.model.lm_head.weight", "lm_head.weight"),
+        ("model.layers.0.mlp.up_proj.weight",  # a text-only name, nested
+         "model.language_model.layers.0.mlp.up_proj.weight"),
+    ):  # fmt: skip
+        assert rft.base_name(key, base) == want
+    flat = {"model.layers.0.mlp.up_proj.weight"}  # a text-only base
+    assert rft.base_name("model_state.model.model.layers.0.mlp.up_proj.weight",
+                         flat) == "model.layers.0.mlp.up_proj.weight"  # fmt: skip
+
+
+def test_judge_server_runs_on_its_own_gpus(tmp_path, monkeypatch):
+    import contextlib
+    import urllib.request
+
+    pytest.importorskip("modal")
+    rft = _load(ROOT / "modal" / "miles_rft.py")
+    started = []
+
+    class Proc:
+        def __init__(self, cmd, env, **kw):
+            started.append((cmd, env))
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(rft.subprocess, "Popen", Proc)
+    monkeypatch.setattr(
+        urllib.request, "urlopen", lambda url, timeout: contextlib.nullcontext()
+    )
+    rft.start_judge_server("gpt-oss-20b", [4], tmp_path / "judge.log")
+    rft.start_judge_server("qwen3.6-35b-a3b", [4, 5], tmp_path / "judge.log")
+    rft.start_judge_server("gpt-oss-20b", [4, 5], tmp_path / "judge.log")
+    with pytest.raises(ValueError, match="multiple of 2"):
+        rft.start_judge_server("qwen3.6-35b-a3b", [4], tmp_path / "judge.log")
+    (oss, oss_env), (qwen, qwen_env), (dp, _) = started
+    assert dp[dp.index("--tp") + 1] == "1" and dp[dp.index("--dp-size") + 1] == "2"
+    assert oss[oss.index("--reasoning-parser") + 1] == "gpt-oss"
+    assert oss_env["CUDA_VISIBLE_DEVICES"] == "4" and oss[oss.index("--tp") + 1] == "1"
+    assert (
+        "--reasoning-parser" not in qwen and qwen_env["CUDA_VISIBLE_DEVICES"] == "4,5"
+    )
+    for _repo, rev, gpus in rft.JUDGE_MODELS.values():
+        assert len(rev) == 40 and gpus in (1, 2)

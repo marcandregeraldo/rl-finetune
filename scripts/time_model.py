@@ -11,11 +11,11 @@ bf16 weights, gradient checkpointing on. Prints s/step and memory next to the
 Rule (PLAN.md, "Models"): over ~5 s/step on the Mac, use the smaller model.
 """
 
-import argparse
 import sys
 import time
 from pathlib import Path
 
+import click
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM
 
@@ -54,27 +54,25 @@ def text_config(name: str) -> dict:
     return {"L": cfg.num_hidden_layers, "h": cfg.hidden_size, "V": cfg.vocab_size}
 
 
-def main() -> None:
-    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    p.add_argument("--model", default="Qwen/Qwen3.5-0.8B")
-    p.add_argument("--batch", type=int, default=4)
-    p.add_argument("--seq", type=int, default=256)
-    p.add_argument("--steps", type=int, default=3)
-    args = p.parse_args()
-
+@click.command(help=__doc__.split("\n\n")[0])
+@click.option("--model", "name", default="Qwen/Qwen3.5-0.8B", show_default=True)
+@click.option("--batch", default=4, show_default=True)
+@click.option("--seq", default=256, show_default=True)
+@click.option("--steps", default=3, show_default=True)
+def main(name: str, batch: int, seq: int, steps: int) -> None:
     dev = device()
-    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16)
+    model = AutoModelForCausalLM.from_pretrained(name, dtype=torch.bfloat16)
     model.config.use_cache = False
     model.gradient_checkpointing_enable()
     model.to(dev).train()
     opt = torch.optim.AdamW(model.parameters(), lr=1e-6)
     n_params = sum(p.numel() for p in model.parameters())
 
-    m = text_config(args.model)
-    ids = torch.randint(0, m["V"], (args.batch, args.seq), device=dev)
+    m = text_config(name)
+    ids = torch.randint(0, m["V"], (batch, seq), device=dev)
 
     peak, times = 0.0, []
-    for i in range(1 + args.steps):  # step 0 is the warm-up
+    for i in range(1 + steps):  # step 0 is the warm-up
         sync(dev)
         t0 = time.perf_counter()
         loss = model(input_ids=ids, labels=ids).loss
@@ -87,13 +85,13 @@ def main() -> None:
         if i:
             times.append(time.perf_counter() - t0)
 
-    tokens = args.batch * args.seq
+    tokens = batch * seq
     # Pure bf16 here: weights, grads and both Adam moments at 2 B each = 8 B/param.
     # memory_math.finetune_gb's 16 B/param is mixed precision (fp32 master + Adam).
     states = n_params * 8 / GB
     predicted = states + activations_gb(m, tokens) + logits_gb(m, tokens)
-    print(f"model      {args.model} ({n_params / 1e9:.2f}B params) on {dev.type}")
-    print(f"shape      {args.batch} x {args.seq} tokens, bf16, grad checkpointing")
+    print(f"model      {name} ({n_params / 1e9:.2f}B params) on {dev.type}")
+    print(f"shape      {batch} x {seq} tokens, bf16, grad checkpointing")
     print(f"s/step     {sum(times) / len(times):.2f} (mean of {len(times)})")
     print(f"memory     {peak:.1f} GB measured, {predicted:.1f} GB predicted")
     print(f"           ({states:.1f} states + activations + fp32 logits)")

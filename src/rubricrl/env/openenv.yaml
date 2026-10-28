@@ -1,0 +1,31 @@
+# OpenEnv manifest for the HealthBench consultation environment (src/rubricrl/env).
+# Not pushed to a Hugging Face Space: it runs as a sidecar of the Miles trainer
+# (modal/miles_rft.py --reward env) or locally (`uvicorn rubricrl.env.server:app`).
+spec_version: 1
+name: healthbench_consult
+version: 0.1.0
+description: >-
+  HealthBench conversations as RL episodes. single (v1): one doctor reply graded on
+  the physicians' rubric by a calibrated LLM judge. patient (v2): a simulated patient
+  continues the conversation; the whole consultation is graded on trajectory-level
+  criteria mapped from the physicians' ones.
+type: space
+runtime: fastapi
+app: rubricrl.env.server:app
+port: 8003
+action: DoctorAction
+observation: ConsultObservation
+validation:
+  reward:
+    # The unclipped HealthBench rubric score: (points of criteria met) / (positive
+    # points). Harmful answers score below 0; the floor depends on the rubric.
+    range: [-10.0, 1.0]
+  resources:
+    cpu: 1.0
+    memory_mb: 2048
+    episode_timeout_s: 900.0 # patient mode: up to 6 patient turns + ~10 judge calls
+  capabilities:
+    verifier:
+      kind: reward_channel
+  types:
+    tags: [health, rubric, llm-judge, multi-turn, simulated-user]

@@ -35,6 +35,9 @@ merged_model_tmp/
 .DS_Store
 
 # Runs, caches, outputs
+data/raw/
+data/miles/
+runs/
 wandb/
 .cache/
 analysis/out/
